@@ -112,6 +112,33 @@ libdovi would accept; any other RPU is dropped (the frame decodes through its
 base layer), logged once (FFmpeg patch 0301). That keeps damaged streams away
 from the parser. It cannot stop a crafted RPU with a correct CRC32.
 
+## Known limits of the Pluet patches
+
+- **vo_avfoundation's bounded waits (mpv 0300).** preinit waits at most 500 ms
+  for the main thread to attach the timebase, register the observers and read
+  the layer's geometry, and the OSD layer's creation waits as long. When a
+  wait times out (the host's main thread is blocked), the VO goes on: frames
+  are enqueued against a layer that may not have its timebase yet and without
+  layer geometry, until the late main-thread block runs and the VO adopts its
+  result on the next VOCTRL_CHECK_EVENTS. Playback is degraded for that time,
+  not hung.
+- **Cached prebuilt archives.** The build checks a prebuilt archive's SHA-256
+  before unpacking it. A cached archive whose hash still matches is not
+  unpacked again, so what was extracted from it earlier in `dist/` is trusted
+  as it is; `make clean` starts over.
+- **`use-prebuilt` binaries.** The per-platform zips `make build use-prebuilt`
+  restores from `artifacts.json` (`prebuilt.<platform>`) carry no hash there,
+  and the Swift driver does not verify them; only the third-party prebuilts
+  in `versions.json` are verified.
+- **First CI run after these patches.** Every Apple content key changes (new
+  patches, the driver, the prebuilt hashes in `versions.json`), so the first
+  publish run builds every Apple library from source.
+- **Network for tests.** `scripts/test_dovi_rpu_check.sh` clones dovi_tool at
+  the pinned commit for libdovi's test RPUs, and, like every harness run
+  without a source tree, fetches the pinned FFmpeg. `test_vt_dovi_conversion_mode.sh`
+  and `test_tx_neon_imdct.sh` build a minimal libavcodec or libavutil on the
+  host (a minute or two each).
+
 ## Spatial audio (`ao=spatial`)
 
 `ao_spatial` (patch 0039) plays TrueHD Atmos and DTS:X by handing mpv's IEC
