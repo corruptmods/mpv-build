@@ -67,6 +67,17 @@ that track to PCM and seeks back to the playback position. The fallback
 belongs to the track: the next track or file, or a later output reload, tries
 passthrough again. Patches 0040-0042 carry the details.
 
+With `--audio-spdif-backoff=yes` (patch 0303; off by default, which is 0040's
+behaviour) the player also remembers the failure, per codec and per player
+instance, with the audio route it happened on: later files and output
+reloads decode that codec to PCM instead of paying the failure's seconds
+again. An entry lapses when the route changes, on iOS and tvOS also when the
+route reports a device change (a receiver power-cycled, a cable replugged),
+after `--audio-spdif-backoff-expiry` seconds (default 600), and once
+passthrough of any codec has played on that route for 10 seconds. It stays
+off until a device shows how tvOS reports route changes around a receiver
+waking and around the PCM output's own session setup.
+
 Mid-stream, the sink watches its own playhead (patch 0302). While the core
 has it playing and at least a second of stream is buffered, a playhead that
 stands still for `--ao-avfoundation-compressed-stall-timeout` seconds

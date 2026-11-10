@@ -17,23 +17,95 @@
 
 #define MP_ERR(...) ((void)0)
 #define MP_VERBOSE(...) ((void)0)
+#define MP_INFO(...) ((void)0)
+#define MP_ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
+#define mp_assert(x) ((void)0)
+#define MP_TIME_S_TO_NS(s) ((int64_t)((s) * INT64_C(1000000000)))
 
 struct mp_log;
 struct mp_async_queue;
-struct mp_pin;
+struct mp_pin { int disconnects; };
 struct mp_decoder_wrapper { bool spdif; int reinits; bool fail_reinit; };
-struct track { struct mp_decoder_wrapper *dec; };
+struct mp_codec_params { const char *codec; };
+struct sh_stream { struct mp_codec_params *codec; };
+struct ao_chain;
+struct track {
+    struct mp_decoder_wrapper *dec;
+    struct sh_stream *stream;
+    struct mp_pin *sink;
+    struct ao_chain *ao_c;
+};
+struct MPOpts { bool audio_spdif_backoff; double audio_spdif_backoff_expiry; };
 struct mp_filter { int resets, wakeups; };
 struct mp_output_chain { int resets; };
-struct ao { int events; int resets; bool closed; };
+struct ao { int events; int resets; bool closed; int format; };
+struct mp_chmap { int num; };
+#define AF_FORMAT_S_EAC3 100
+static bool af_fmt_is_spdif(int format) { return format == AF_FORMAT_S_EAC3; }
+static void ao_get_format(struct ao *ao, int *rate, int *format, struct mp_chmap *ch)
+{
+    *rate = 48000;
+    *format = ao->format;
+    ch->num = 2;
+}
+// The player clock, moved by the test.
+static int64_t now_ns = INT64_C(1000000000000);
+static int64_t mp_time_ns(void) { return now_ns; }
 
 #include "passthrough_fallback_types.inc"
 
 struct MPContext {
+    struct MPOpts *opts;
+    struct mp_filter *filter_root;
     struct ao *ao;
     struct ao_chain *ao_chain;
+    struct spdif_backoff spdif_backoff[8];
+    int num_spdif_backoff;
+    struct ao_route_watch *spdif_route_watch;
+    int64_t spdif_ok_since_ns;
+    bool paused;
     enum playback_status audio_status;
 };
+
+// The route watch (ao_route_watch_*): a device change the test reports.
+struct ao_route_watch { bool fired; };
+static struct ao_route_watch the_watch;
+static int watches_created;
+static struct ao_route_watch *ao_route_watch_create(void)
+{
+    watches_created++;
+    the_watch.fired = false;
+    return &the_watch;
+}
+static bool ao_route_watch_fired(struct ao_route_watch *w)
+{
+    if (!w)
+        return false;
+    bool f = w->fired;
+    w->fired = false;
+    return f;
+}
+
+// The system's audio route, as ao_get_route_id() reports it; NULL = unknown.
+static const char *current_route = "hdmi:1;";
+static bool ao_get_route_id(char *buf, size_t size)
+{
+    if (!current_route)
+        return false;
+    snprintf(buf, size, "%s", current_route);
+    return true;
+}
+
+// init_audio_decoder()'s decoder: the rig's, set up afresh as for a new file.
+static struct mp_decoder_wrapper *next_dec;
+static struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
+                                                            struct sh_stream *src)
+{
+    (void)parent; (void)src;
+    *next_dec = (struct mp_decoder_wrapper){0};
+    return next_dec;
+}
+static void mp_pin_disconnect(struct mp_pin *p) { p->disconnects++; }
 
 // --- fakes: audio/out/ao.c, player/audio.c and player/misc.c, as far as the
 // extracted code reaches.
@@ -104,6 +176,9 @@ static int failures;
     fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
 
 struct rig {
+    struct MPOpts opts;
+    struct mp_codec_params codec;
+    struct sh_stream stream;
     struct MPContext mpctx;
     struct ao ao;
     struct ao_chain ao_c;
@@ -122,6 +197,13 @@ static void rig_init(struct rig *r)
     refresh_precision = MPSEEK_DEFAULT;
     r->dec.spdif = true;
     r->track.dec = &r->dec;
+    // The 0040 cases run without the back-off (--audio-spdif-backoff=no).
+    r->mpctx.opts = &r->opts;
+    r->codec.codec = "eac3";
+    r->stream.codec = &r->codec;
+    r->track.stream = &r->stream;
+    r->track.ao_c = &r->ao_c;
+    current_route = "hdmi:1;";
     r->ao_c.mpctx = &r->mpctx;
     r->ao_c.spdif_passthrough = true;
     r->ao_c.filter = &r->chain;
@@ -233,6 +315,206 @@ int main(void)
     CHECK(track_errors == 1 && errored_track == &r.track && !r.mpctx.ao_chain,
           "reinit failure: the track was not errored (%d)", track_errors);
     CHECK(refresh_seeks == 0, "reinit failure: a refresh seek ran for a freed chain");
+
+    // 0303, --audio-spdif-backoff (default no; on for these cases, with the
+    // expiry off unless a case sets it). After a mid-stream failure
+    // on this player, the codec is decoded to PCM on this route: a later
+    // output reload and the next file's decoder skip passthrough.
+    rig_init(&r);
+    r.opts.audio_spdif_backoff = true;
+    r.ao.events = AO_EVENT_PASSTHROUGH_FAILED;
+    handle_ao_events(&r.mpctx);
+    CHECK(decodes_to_pcm(&r) && refresh_seeks == 1, "back-off: the failure itself falls back as before");
+    CHECK(r.mpctx.num_spdif_backoff == 1 && !strcmp(r.mpctx.spdif_backoff[0].codec, "eac3") &&
+          r.mpctx.spdif_backoff[0].route_known &&
+          !strcmp(r.mpctx.spdif_backoff[0].route, "hdmi:1;"),
+          "back-off: the codec and its route are not recorded");
+    struct ao pcm2 = {.events = AO_EVENT_RELOAD};
+    r.mpctx.ao = &pcm2;
+    r.ao_c.ao = &pcm2;
+    handle_ao_events(&r.mpctx);
+    CHECK(decodes_to_pcm(&r) && r.dec.reinits == 1,
+          "back-off: a reload on the same route retried passthrough (spdif %d, reinits %d)",
+          r.dec.spdif, r.dec.reinits);
+
+    // The next file on the same player: its decoder starts as PCM.
+    struct mp_decoder_wrapper dec2;
+    next_dec = &dec2;
+    r.track.dec = NULL;
+    r.ao_c.spdif_passthrough = true;
+    r.ao_c.spdif_failed = false;
+    CHECK(init_audio_decoder(&r.mpctx, &r.track) == 1 && !dec2.spdif &&
+          !r.ao_c.spdif_passthrough && !r.ao_c.spdif_failed,
+          "back-off: the next file tried passthrough (spdif %d)", dec2.spdif);
+
+    // Another codec is not affected.
+    r.codec.codec = "ac3";
+    r.track.dec = NULL;
+    r.ao_c.spdif_passthrough = true;
+    CHECK(init_audio_decoder(&r.mpctx, &r.track) == 1 && dec2.spdif && r.ao_c.spdif_passthrough,
+          "back-off: AC-3 lost passthrough for an E-AC-3 failure");
+    r.codec.codec = "eac3";
+
+    // An unknown route counts as the same.
+    current_route = NULL;
+    r.track.dec = NULL;
+    CHECK(init_audio_decoder(&r.mpctx, &r.track) == 1 && !dec2.spdif,
+          "back-off: an unknown route cleared it");
+
+    // The route changes: the entry goes and passthrough is tried again, on
+    // the next decoder and on a reload alike.
+    current_route = "airpods:2;";
+    r.track.dec = NULL;
+    r.ao_c.spdif_passthrough = true;
+    CHECK(init_audio_decoder(&r.mpctx, &r.track) == 1 && dec2.spdif &&
+          r.ao_c.spdif_passthrough && r.mpctx.num_spdif_backoff == 0,
+          "back-off: a route change did not clear it (spdif %d, entries %d)",
+          dec2.spdif, r.mpctx.num_spdif_backoff);
+    rig_init(&r);
+    r.opts.audio_spdif_backoff = true;
+    r.ao.events = AO_EVENT_PASSTHROUGH_FAILED;
+    handle_ao_events(&r.mpctx);
+    current_route = "hdmi:2;";
+    struct ao pcm3 = {.events = AO_EVENT_RELOAD};
+    r.mpctx.ao = &pcm3;
+    r.ao_c.ao = &pcm3;
+    handle_ao_events(&r.mpctx);
+    CHECK(still_passthrough(&r) && r.dec.reinits == 2 && r.mpctx.num_spdif_backoff == 0,
+          "back-off: a reload after a route change did not retry passthrough");
+
+    // The same route id, but the route reported a device change since the
+    // failure (the receiver was power-cycled, the cable replugged): the
+    // table is cleared and passthrough is tried again.
+    rig_init(&r);
+    r.opts.audio_spdif_backoff = true;
+    watches_created = 0;
+    the_watch.fired = true; // a change from before the failure does not count
+    r.ao.events = AO_EVENT_PASSTHROUGH_FAILED;
+    handle_ao_events(&r.mpctx);
+    CHECK(r.mpctx.spdif_route_watch == &the_watch && watches_created == 1,
+          "route event: the failure did not start watching the route");
+    struct mp_decoder_wrapper dec4;
+    next_dec = &dec4;
+    r.track.dec = NULL;
+    r.ao_c.spdif_passthrough = true;
+    CHECK(init_audio_decoder(&r.mpctx, &r.track) == 1 && !dec4.spdif,
+          "route event: a change before the failure cleared it");
+    the_watch.fired = true;
+    r.track.dec = NULL;
+    r.ao_c.spdif_passthrough = true;
+    CHECK(init_audio_decoder(&r.mpctx, &r.track) == 1 && dec4.spdif &&
+          r.ao_c.spdif_passthrough && r.mpctx.num_spdif_backoff == 0,
+          "route event: same route id after a device change kept the back-off "
+          "(spdif %d, entries %d)", dec4.spdif, r.mpctx.num_spdif_backoff);
+    // And through a reload of the PCM output.
+    rig_init(&r);
+    r.opts.audio_spdif_backoff = true;
+    r.mpctx.spdif_route_watch = &the_watch;
+    r.ao.events = AO_EVENT_PASSTHROUGH_FAILED;
+    handle_ao_events(&r.mpctx);
+    the_watch.fired = true;
+    struct ao pcm4 = {.events = AO_EVENT_RELOAD};
+    r.mpctx.ao = &pcm4;
+    r.ao_c.ao = &pcm4;
+    handle_ao_events(&r.mpctx);
+    CHECK(still_passthrough(&r) && r.mpctx.num_spdif_backoff == 0,
+          "route event: a reload after a device change did not retry passthrough");
+    CHECK(watches_created == 1, "route event: the player's watch was not reused");
+
+    // Per player: a second player in the process is unaffected.
+    struct rig other;
+    rig_init(&other);
+    other.opts.audio_spdif_backoff = true;
+    struct mp_decoder_wrapper dec3;
+    next_dec = &dec3;
+    other.track.dec = NULL;
+    CHECK(init_audio_decoder(&other.mpctx, &other.track) == 1 && dec3.spdif,
+          "back-off: leaked into another player");
+
+    // A failure at output init (no event) is not backed off: it costs nothing.
+    rig_init(&r);
+    r.opts.audio_spdif_backoff = true;
+    CHECK(fall_back_to_pcm(&r.mpctx, &r.ao_c) && r.mpctx.num_spdif_backoff == 0,
+          "back-off: recorded without a mid-stream failure");
+
+    // The expiry: an entry lapses --audio-spdif-backoff-expiry after its
+    // failure, on the same route.
+    rig_init(&r);
+    r.opts.audio_spdif_backoff = true;
+    r.opts.audio_spdif_backoff_expiry = 600;
+    r.ao.events = AO_EVENT_PASSTHROUGH_FAILED;
+    handle_ao_events(&r.mpctx);
+    struct mp_decoder_wrapper dec5;
+    next_dec = &dec5;
+    now_ns += MP_TIME_S_TO_NS(599);
+    r.track.dec = NULL;
+    CHECK(init_audio_decoder(&r.mpctx, &r.track) == 1 && !dec5.spdif,
+          "expiry: lapsed early");
+    now_ns += MP_TIME_S_TO_NS(1);
+    r.track.dec = NULL;
+    r.ao_c.spdif_passthrough = true;
+    CHECK(init_audio_decoder(&r.mpctx, &r.track) == 1 && dec5.spdif &&
+          r.mpctx.num_spdif_backoff == 0, "expiry: not lapsed at 600 s");
+
+    // A passthrough output that plays for 10 s on the same route clears the
+    // route's entries, of any codec; one on another route stays. Pausing
+    // or a PCM output does not count.
+    rig_init(&r);
+    r.opts.audio_spdif_backoff = true;
+    r.ao.events = AO_EVENT_PASSTHROUGH_FAILED;
+    handle_ao_events(&r.mpctx);              // eac3 backed off on hdmi:1
+    current_route = "hdmi:2;";
+    r.codec.codec = "truehd";
+    spdif_back_off(&r.mpctx, &r.track);      // truehd on another route
+    current_route = "hdmi:1;";
+    CHECK(r.mpctx.num_spdif_backoff == 2, "success: setup (%d)", r.mpctx.num_spdif_backoff);
+    struct ao ac3 = { .format = AF_FORMAT_S_EAC3 };
+    r.mpctx.ao = &ac3;
+    r.ao_c.ao = &ac3;
+    r.ao_c.spdif_passthrough = true;         // an AC-3 track passing through
+    r.mpctx.audio_status = STATUS_PLAYING;
+    handle_ao_events(&r.mpctx);
+    now_ns += MP_TIME_S_TO_NS(5);
+    r.mpctx.paused = true;
+    handle_ao_events(&r.mpctx);              // a pause restarts the count
+    r.mpctx.paused = false;
+    handle_ao_events(&r.mpctx);
+    now_ns += MP_TIME_S_TO_NS(9.9);
+    handle_ao_events(&r.mpctx);
+    CHECK(r.mpctx.num_spdif_backoff == 2, "success: cleared before 10 s of playing");
+    now_ns += MP_TIME_S_TO_NS(0.1);
+    handle_ao_events(&r.mpctx);
+    CHECK(r.mpctx.num_spdif_backoff == 1 && !strcmp(r.mpctx.spdif_backoff[0].codec, "truehd"),
+          "success: the route's entries were not cleared, or another route's were "
+          "(%d left)", r.mpctx.num_spdif_backoff);
+    struct ao pcm5 = { .format = 1 };
+    r.mpctx.ao = &pcm5;
+    r.ao_c.ao = &pcm5;
+    current_route = "hdmi:2;";
+    now_ns += MP_TIME_S_TO_NS(60);
+    handle_ao_events(&r.mpctx);
+    handle_ao_events(&r.mpctx);
+    CHECK(r.mpctx.num_spdif_backoff == 1, "success: a PCM output counted as passthrough");
+    r.codec.codec = "eac3";
+
+    // Off (the default): nothing is recorded and nothing is skipped.
+    rig_init(&r);
+    r.ao.events = AO_EVENT_PASSTHROUGH_FAILED;
+    handle_ao_events(&r.mpctx);
+    CHECK(decodes_to_pcm(&r) && r.mpctx.num_spdif_backoff == 0 && !r.mpctx.spdif_route_watch,
+          "off: a failure was recorded");
+
+    // The table is bounded; the oldest goes.
+    rig_init(&r);
+    r.opts.audio_spdif_backoff = true;
+    static char names[10][8];
+    for (int i = 0; i < 10; i++) {
+        snprintf(names[i], sizeof(names[i]), "c%d", i);
+        r.codec.codec = names[i];
+        spdif_back_off(&r.mpctx, &r.track);
+    }
+    CHECK(r.mpctx.num_spdif_backoff == 8 && !strcmp(r.mpctx.spdif_backoff[0].codec, "c2") &&
+          !strcmp(r.mpctx.spdif_backoff[7].codec, "c9"), "back-off: table overflow");
 
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);

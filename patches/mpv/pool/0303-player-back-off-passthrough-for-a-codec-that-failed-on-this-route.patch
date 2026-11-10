@@ -1,0 +1,538 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: [PATCH] player: back off passthrough for a codec that failed on
+ this route
+
+Since 0040 a passthrough output that fails while playing (the AVPlayer sink
+or ao_spatial) makes the track fall back to PCM, and the fallback belongs to
+that track: the next file, and any later output reload, try passthrough
+again. When the failure is not transient (a host that never services the
+main queue, a route AVPlayer cannot drive), every file pays the ~4.4 s
+again before it gets audio.
+
+The player now remembers, per codec, a passthrough failure reported through
+AO_EVENT_PASSTHROUGH_FAILED together with the audio route it happened on
+(ao_get_route_id(): the AVAudioSession route's output ports on iOS/tvOS,
+the default output device's UID on macOS). While the route is the same, a
+new decoder for that codec starts as PCM and an output reload does not
+retry it. A different route clears the entry and passthrough is tried
+again; an unknown route counts as the same. Any device change the route
+reports after the failure also clears the whole table, the same device
+coming back included, since a receiver that was off or in the wrong mode
+often takes passthrough once it returns: on iOS/tvOS the player keeps an
+AVAudioSession route-change watch from its first failure until it is
+destroyed, counting new/old device, override and route-configuration
+changes but not category changes, which a PCM output's own session setup
+posts right after the fallback. macOS has no such listener and relies on
+the route identity. The table lives in MPContext
+(8 codecs, oldest dropped), so it is per player and ends with it; nothing
+is process-wide. Failures at output init cost nothing and are not
+recorded.
+
+An entry also lapses after --audio-spdif-backoff-expiry seconds (default
+600, 0 never), and once passthrough of any codec has played on the same
+route for 10 s, so one transient failure cannot cost passthrough for the
+session.
+
+--audio-spdif-backoff defaults to no, exactly 0040's behaviour, until a
+device shows how tvOS reports route changes around a receiver waking and
+around the PCM output's own session setup.
+
+test_audio_passthrough_fallback.sh drives it: the failure, a reload and the
+next file on the same route, another codec, an unknown route, a route
+change for a decoder and for a reload, a device change on the same route
+id (only one after the failure counts), a second player, the expiry, the
+lapse after passthrough plays (not while paused, not for PCM, not for
+another route), the option off, and the bound; its driver checks the
+defaults.
+
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 666f01e..2d00dc6 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -2140,6 +2140,22 @@ Audio
+         multichannel PCM, and mpv supports lossless DTS-HD decoding via
+         FFmpeg's new DCA decoder (based on libdcadec).
+ 
++``--audio-spdif-backoff=<yes|no>``
++    When a passthrough output fails while playing (on Apple platforms, the
++    AVPlayer and spatial audio outputs; each failure costs several seconds
++    before the PCM fallback), decode that codec to PCM on this audio route
++    instead of trying passthrough again on every file and output reload
++    (default: no, which retries on the next file or reload). It is kept per
++    codec and per player instance, and an entry lapses when the route
++    changes (on iOS and tvOS also when the route reports a device change,
++    the same device coming back included), after
++    ``--audio-spdif-backoff-expiry``, and once passthrough of any codec has
++    played on the same route for 10 seconds.
++
++``--audio-spdif-backoff-expiry=<seconds>``
++    How long a ``--audio-spdif-backoff`` entry lasts at most (default: 600).
++    0 keeps it until one of the other conditions clears it.
++
+ ``--ad=<decoder1,decoder2,...[-]>``
+     Specify a priority list of audio decoders to be used, according to their
+     decoder name. When determining which decoder to use, the first decoder that
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 4fc4490..4e25a98 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -395,6 +395,56 @@ void ao_request_pcm_fallback(struct ao *ao)
+     ao_add_events(ao, AO_EVENT_PASSTHROUGH_FAILED);
+ }
+ 
++#if HAVE_AVFOUNDATION
++bool ao_avfoundation_route_id(char *buf, size_t size);
++struct ao_route_watch *ao_avfoundation_route_watch_create(void);
++bool ao_avfoundation_route_watch_fired(struct ao_route_watch *w);
++void ao_avfoundation_route_watch_destroy(struct ao_route_watch *w);
++#endif
++
++// Write an identity of the system's current audio output route to buf, for
++// remembering what failed on it. Returns false where the route is unknown
++// (no platform support, or the query failed). Any thread.
++bool ao_get_route_id(char *buf, size_t size)
++{
++#if HAVE_AVFOUNDATION
++    return ao_avfoundation_route_id(buf, size);
++#else
++    return false;
++#endif
++}
++
++// A watch for changes of the system's audio output device, independent of any
++// AO (the player keeps one while it has backed off passthrough). NULL where
++// the platform has none (only iOS/tvOS do); fired() then never reports.
++struct ao_route_watch *ao_route_watch_create(void)
++{
++#if HAVE_AVFOUNDATION
++    return ao_avfoundation_route_watch_create();
++#else
++    return NULL;
++#endif
++}
++
++// Whether the route changed since the watch was created or last asked;
++// clears the report. Any thread.
++bool ao_route_watch_fired(struct ao_route_watch *w)
++{
++#if HAVE_AVFOUNDATION
++    return w && ao_avfoundation_route_watch_fired(w);
++#else
++    return false;
++#endif
++}
++
++void ao_route_watch_destroy(struct ao_route_watch *w)
++{
++#if HAVE_AVFOUNDATION
++    if (w)
++        ao_avfoundation_route_watch_destroy(w);
++#endif
++}
++
+ // Notify the player that the device list changed. Fully thread-safe.
+ void ao_hotplug_event(struct ao *ao)
+ {
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index c3d4918..57d3d7b 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -109,6 +109,11 @@ struct mp_async_queue *ao_get_queue(struct ao *ao);
+ int ao_query_and_reset_events(struct ao *ao, int events);
+ void ao_request_reload(struct ao *ao);
+ void ao_request_pcm_fallback(struct ao *ao);
++bool ao_get_route_id(char *buf, size_t size);
++struct ao_route_watch;
++struct ao_route_watch *ao_route_watch_create(void);
++bool ao_route_watch_fired(struct ao_route_watch *w);
++void ao_route_watch_destroy(struct ao_route_watch *w);
+ void ao_hotplug_event(struct ao *ao);
+ 
+ struct ao_hotplug;
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index 1219de3..cd6769b 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -1749,6 +1749,111 @@ static void uninit(struct ao *ao)
+ #endif
+ }
+ 
++// ao_get_route_id(): the outputs of the audio session's current route on
++// iOS/tvOS (port type and UID of each), the default output device's UID on
++// macOS.
++bool ao_avfoundation_route_id(char *buf, size_t size)
++{
++    if (!size)
++        return false;
++    buf[0] = '\0';
++#if TARGET_OS_IPHONE
++    @autoreleasepool {
++        AVAudioSessionRouteDescription *route = AVAudioSession.sharedInstance.currentRoute;
++        NSMutableString *id = [NSMutableString string];
++        for (AVAudioSessionPortDescription *port in route.outputs)
++            [id appendFormat:@"%@:%@;", port.portType, port.UID];
++        const char *str = id.UTF8String;
++        snprintf(buf, size, "%s", str ? str : "");
++        return true;
++    }
++#elif HAVE_COREAUDIO
++    AudioObjectID device = kAudioObjectUnknown;
++    AudioObjectPropertyAddress addr = {
++        kAudioHardwarePropertyDefaultOutputDevice,
++        kAudioObjectPropertyScopeGlobal,
++        0, // kAudioObjectPropertyElementMain
++    };
++    UInt32 len = sizeof(device);
++    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL,
++                                   &len, &device) != noErr ||
++        device == kAudioObjectUnknown)
++        return false;
++    CFStringRef uid = NULL;
++    addr.mSelector = kAudioDevicePropertyDeviceUID;
++    len = sizeof(uid);
++    if (AudioObjectGetPropertyData(device, &addr, 0, NULL, &len, &uid) != noErr || !uid)
++        return false;
++    bool ok = CFStringGetCString(uid, buf, size, kCFStringEncodingUTF8);
++    CFRelease(uid);
++    return ok;
++#else
++    return false;
++#endif
++}
++
++#if TARGET_OS_IPHONE
++// ao_route_watch_*(): one AVAudioSession route-change observer. The flag
++// lives in this object, which the notification block retains, so a delivery
++// still in flight when the player destroys the watch writes into memory that
++// is still alive. Only reasons that mean the output device changed count; a
++// category change is left out, because a PCM output's own session setup
++// posts one right after the fallback that created the watch.
++@interface AVFRouteWatch : NSObject {
++@public
++    atomic_bool fired;
++    id token;
++}
++@end
++@implementation AVFRouteWatch
++@end
++
++struct ao_route_watch *ao_avfoundation_route_watch_create(void)
++{
++    AVFRouteWatch *w = [[AVFRouteWatch alloc] init];
++    atomic_init(&w->fired, false);
++    w->token = [[[NSNotificationCenter defaultCenter]
++        addObserverForName:AVAudioSessionRouteChangeNotification
++                    object:nil
++                     queue:nil
++                usingBlock:^(NSNotification *note) {
++        NSUInteger reason =
++            [note.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
++        switch (reason) {
++        case AVAudioSessionRouteChangeReasonNewDeviceAvailable:
++        case AVAudioSessionRouteChangeReasonOldDeviceUnavailable:
++        case AVAudioSessionRouteChangeReasonOverride:
++        case AVAudioSessionRouteChangeReasonRouteConfigurationChange:
++            atomic_store(&w->fired, true);
++            break;
++        default:
++            break;
++        }
++    }] retain];
++    return (struct ao_route_watch *)w;
++}
++
++bool ao_avfoundation_route_watch_fired(struct ao_route_watch *watch)
++{
++    AVFRouteWatch *w = (AVFRouteWatch *)watch;
++    return atomic_exchange(&w->fired, false);
++}
++
++void ao_avfoundation_route_watch_destroy(struct ao_route_watch *watch)
++{
++    AVFRouteWatch *w = (AVFRouteWatch *)watch;
++    [[NSNotificationCenter defaultCenter] removeObserver:w->token];
++    [w->token release];
++    [w release];
++}
++#else
++// macOS has no route-change listener here; the route identity check alone
++// clears the back-off.
++struct ao_route_watch *ao_avfoundation_route_watch_create(void) { return NULL; }
++bool ao_avfoundation_route_watch_fired(struct ao_route_watch *w) { return false; }
++void ao_avfoundation_route_watch_destroy(struct ao_route_watch *w) {}
++#endif
++
+ #define OPT_BASE_STRUCT struct priv
+ 
+ const struct ao_driver audio_out_avfoundation = {
+diff --git a/options/options.c b/options/options.c
+index 26b4723..1790c82 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -756,6 +756,9 @@ static const m_option_t mp_opts[] = {
+     {"", OPT_SUBSTRUCT(ao_opts, ao_conf)},
+     {"audio-exclusive", OPT_BOOL(audio_exclusive), .flags = UPDATE_AUDIO},
+     {"audio-fallback-to-null", OPT_BOOL(ao_null_fallback)},
++    {"audio-spdif-backoff", OPT_BOOL(audio_spdif_backoff)},
++    {"audio-spdif-backoff-expiry", OPT_DOUBLE(audio_spdif_backoff_expiry),
++        M_RANGE(0, 86400)},
+     {"audio-stream-silence", OPT_BOOL(audio_stream_silence)},
+     {"audio-wait-open", OPT_FLOAT(audio_wait_open), M_RANGE(0, 60)},
+     {"force-window", OPT_CHOICE(force_vo,
+@@ -1000,6 +1003,7 @@ static const struct MPOpts mp_default_opts = {
+     .softvol_gain_min = -96,
+     .softvol_gain = 0,
+     .gapless_audio = -1,
++    .audio_spdif_backoff_expiry = 600,
+     .wintitle = "${?media-title:${media-title}}${!media-title:No file} - mpv",
+     .stop_screensaver = 1,
+     .cursor_autohide_delay = 1000,
+diff --git a/options/options.h b/options/options.h
+index 53bc367..62ddc3d 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -200,6 +200,8 @@ typedef struct MPOpts {
+ 
+     bool audio_exclusive;
+     bool ao_null_fallback;
++    bool audio_spdif_backoff;
++    double audio_spdif_backoff_expiry;
+     bool audio_stream_silence;
+     float audio_wait_open;
+     int force_vo;
+diff --git a/player/audio.c b/player/audio.c
+index e581066..d42ab2c 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -355,6 +355,136 @@ static void ao_chain_set_ao(struct ao_chain *ao_c, struct ao *ao)
+     mp_filter_wakeup(ao_c->ao_filter);
+ }
+ 
++// Whether this player backed off passthrough for the track's codec
++// (spdif_back_off) on the current audio route. A route that differs from the
++// one it failed on clears the entry: the new route gets to try again. An
++// unknown route on either side counts as the same. An entry also lapses
++// --audio-spdif-backoff-expiry seconds after its failure, and once
++// passthrough has played on the route (spdif_note_passthrough_playing), so
++// a single transient failure cannot cost passthrough for the session.
++static bool spdif_backed_off(struct MPContext *mpctx, struct track *track)
++{
++    if (!mpctx->opts->audio_spdif_backoff || !track || !track->stream ||
++        !track->stream->codec || !track->stream->codec->codec)
++        return false;
++    const char *codec = track->stream->codec->codec;
++    // Any device change on the route since the failure clears every entry,
++    // the same device coming back included: a receiver that was off or in
++    // the wrong mode often takes passthrough once it returns.
++    if (mpctx->num_spdif_backoff && ao_route_watch_fired(mpctx->spdif_route_watch)) {
++        MP_INFO(mpctx, "Audio route changed; trying passthrough again.\n");
++        mpctx->num_spdif_backoff = 0;
++        return false;
++    }
++    double expiry = mpctx->opts->audio_spdif_backoff_expiry;
++    for (int i = 0; i < mpctx->num_spdif_backoff; i++) {
++        struct spdif_backoff *b = &mpctx->spdif_backoff[i];
++        if (strcmp(b->codec, codec))
++            continue;
++        if (expiry > 0 && mp_time_ns() - b->failed_ns >= MP_TIME_S_TO_NS(expiry)) {
++            MP_INFO(mpctx, "%s passthrough back-off expired; trying it again.\n",
++                    codec);
++            mpctx->spdif_backoff[i] = mpctx->spdif_backoff[--mpctx->num_spdif_backoff];
++            return false;
++        }
++        char route[sizeof(b->route)];
++        if (b->route_known && ao_get_route_id(route, sizeof(route)) &&
++            strcmp(route, b->route))
++        {
++            MP_INFO(mpctx, "Audio route changed; trying %s passthrough again.\n",
++                    codec);
++            mpctx->spdif_backoff[i] = mpctx->spdif_backoff[--mpctx->num_spdif_backoff];
++            return false;
++        }
++        return true;
++    }
++    return false;
++}
++
++// The track's passthrough output failed while playing: decode its codec to
++// PCM on this player until the audio route changes, instead of losing the
++// seconds a failing output takes on every later file and output reload.
++static void spdif_back_off(struct MPContext *mpctx, struct track *track)
++{
++    if (!mpctx->opts->audio_spdif_backoff || !track || !track->stream ||
++        !track->stream->codec || !track->stream->codec->codec)
++        return;
++    const char *codec = track->stream->codec->codec;
++    struct spdif_backoff *b = NULL;
++    for (int i = 0; i < mpctx->num_spdif_backoff; i++) {
++        if (!strcmp(mpctx->spdif_backoff[i].codec, codec))
++            b = &mpctx->spdif_backoff[i];
++    }
++    if (!b) {
++        int max = MP_ARRAY_SIZE(mpctx->spdif_backoff);
++        if (mpctx->num_spdif_backoff == max) {
++            // Forget the oldest.
++            memmove(&mpctx->spdif_backoff[0], &mpctx->spdif_backoff[1],
++                    (max - 1) * sizeof(mpctx->spdif_backoff[0]));
++            mpctx->num_spdif_backoff--;
++        }
++        b = &mpctx->spdif_backoff[mpctx->num_spdif_backoff++];
++    }
++    snprintf(b->codec, sizeof(b->codec), "%s", codec);
++    b->route_known = ao_get_route_id(b->route, sizeof(b->route));
++    b->failed_ns = mp_time_ns();
++    mpctx->spdif_ok_since_ns = 0;
++    if (!mpctx->spdif_route_watch)
++        mpctx->spdif_route_watch = ao_route_watch_create();
++    else
++        ao_route_watch_fired(mpctx->spdif_route_watch); // changes before now don't count
++    MP_INFO(mpctx, "%s passthrough failed; decoding it to PCM on this audio "
++            "route from now on.\n", codec);
++}
++
++// How long a passthrough output must play, unpaused and without a failure,
++// before the back-off entries for its route lapse.
++#define SPDIF_BACKOFF_OK_NS MP_TIME_S_TO_NS(10)
++
++// Passthrough working on a route is evidence its earlier failure was
++// transient: once any codec's passthrough output has played for
++// SPDIF_BACKOFF_OK_NS, drop the entries recorded on the same route (an
++// unknown route counts as the same). Every playloop iteration.
++static void spdif_note_passthrough_playing(struct MPContext *mpctx)
++{
++    struct ao_chain *ao_c = mpctx->ao_chain;
++    bool playing = false;
++    if (mpctx->num_spdif_backoff && mpctx->ao && ao_c && ao_c->ao == mpctx->ao &&
++        ao_c->spdif_passthrough && mpctx->audio_status == STATUS_PLAYING &&
++        !mpctx->paused)
++    {
++        int rate, format;
++        struct mp_chmap channels;
++        ao_get_format(mpctx->ao, &rate, &format, &channels);
++        playing = af_fmt_is_spdif(format);
++    }
++    if (!playing) {
++        mpctx->spdif_ok_since_ns = 0;
++        return;
++    }
++    int64_t now = mp_time_ns();
++    if (!mpctx->spdif_ok_since_ns) {
++        mpctx->spdif_ok_since_ns = now;
++        return;
++    }
++    if (now - mpctx->spdif_ok_since_ns < SPDIF_BACKOFF_OK_NS)
++        return;
++    mpctx->spdif_ok_since_ns = 0;
++    char route[sizeof(mpctx->spdif_backoff[0].route)];
++    bool known = ao_get_route_id(route, sizeof(route));
++    int kept = 0;
++    for (int i = 0; i < mpctx->num_spdif_backoff; i++) {
++        struct spdif_backoff *b = &mpctx->spdif_backoff[i];
++        if (known && b->route_known && strcmp(route, b->route)) {
++            mpctx->spdif_backoff[kept++] = *b;
++            continue;
++        }
++        MP_INFO(mpctx, "Passthrough is playing on this audio route; trying %s "
++                "passthrough again.\n", b->codec);
++    }
++    mpctx->num_spdif_backoff = kept;
++}
++
+ // Switch the chain's track from passthrough to decoding. The caller resets
+ // the output chain. Returns false if the decoder could not be reinitialized.
+ static bool fall_back_to_pcm(struct MPContext *mpctx, struct ao_chain *ao_c)
+@@ -534,8 +664,15 @@ int init_audio_decoder(struct MPContext *mpctx, struct track *track)
+     if (!track->dec)
+         goto init_error;
+ 
+-    if (track->ao_c)
+-        mp_decoder_wrapper_set_spdif_flag(track->dec, true);
++    if (track->ao_c) {
++        bool spdif = !spdif_backed_off(mpctx, track);
++        if (!spdif) {
++            MP_VERBOSE(mpctx, "Passthrough failed earlier on this audio route; "
++                       "decoding to PCM.\n");
++            track->ao_c->spdif_passthrough = false;
++        }
++        mp_decoder_wrapper_set_spdif_flag(track->dec, spdif);
++    }
+ 
+     if (!mp_decoder_wrapper_reinit(track->dec))
+         goto init_error;
+@@ -795,7 +932,7 @@ void reload_audio_output(struct MPContext *mpctx)
+     // to PCM again if necessary).
+     if (ao_c && ao_c->track) {
+         struct mp_decoder_wrapper *dec = ao_c->track->dec;
+-        if (dec && ao_c->spdif_failed) {
++        if (dec && ao_c->spdif_failed && !spdif_backed_off(mpctx, ao_c->track)) {
+             ao_c->spdif_passthrough = true;
+             ao_c->spdif_failed = false;
+             mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, true);
+@@ -880,6 +1017,7 @@ void audio_start_ao(struct MPContext *mpctx)
+ 
+ static void handle_ao_events(struct MPContext *mpctx)
+ {
++    spdif_note_passthrough_playing(mpctx);
+     if (!mpctx->ao)
+         return;
+     int events = ao_query_and_reset_events(mpctx->ao,
+@@ -902,6 +1040,7 @@ static void handle_ao_events(struct MPContext *mpctx)
+     if (!fall_back)
+         return;
+ 
++    spdif_back_off(mpctx, ao_c->track);
+     if (!fall_back_to_pcm(mpctx, ao_c)) {
+         MP_ERR(mpctx, "Error reinitializing audio.\n");
+         error_on_track(mpctx, ao_c->track);
+diff --git a/player/core.h b/player/core.h
+index c3e0816..f56583b 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -176,6 +176,17 @@ struct vo_chain {
+     bool underrun_signaled;
+ };
+ 
++// A codec whose passthrough output failed mid-stream on this player
++// (AO_EVENT_PASSTHROUGH_FAILED), and the audio route it failed on. Until the
++// route changes, the player decodes that codec to PCM instead of paying for
++// the failure again (--audio-spdif-backoff).
++struct spdif_backoff {
++    char codec[32];
++    char route[256];
++    bool route_known;
++    int64_t failed_ns;      // mp_time_ns() of the failure, for the expiry
++};
++
+ // Like vo_chain, for audio.
+ struct ao_chain {
+     struct mp_log *log;
+@@ -324,6 +335,14 @@ typedef struct MPContext {
+     struct ao *ao;
+     struct mp_aframe *ao_filter_fmt; // for weak gapless audio check
+     struct ao_chain *ao_chain;
++    struct spdif_backoff spdif_backoff[8];
++    int num_spdif_backoff;
++    // Created with the first entry: any device change on the route since
++    // then clears the table, the same device coming back included.
++    struct ao_route_watch *spdif_route_watch;
++    // Since when a passthrough output has been playing on this player while
++    // entries exist (0: not now); see spdif_note_passthrough_playing().
++    int64_t spdif_ok_since_ns;
+ 
+     struct vo_chain *vo_chain;
+ 
+diff --git a/player/main.c b/player/main.c
+index 37eb6b1..d4906fb 100644
+--- a/player/main.c
++++ b/player/main.c
+@@ -180,6 +180,8 @@ void mp_destroy(struct MPContext *mpctx)
+     mpctx->ipc_ctx = NULL;
+ 
+     uninit_audio_out(mpctx);
++    ao_route_watch_destroy(mpctx->spdif_route_watch);
++    mpctx->spdif_route_watch = NULL;
+     uninit_video_out(mpctx);
+ 
+     // If it's still set here, it's an error.

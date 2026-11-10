@@ -26,6 +26,6 @@ printf '#pragma once\n#define HAVE_AVFOUNDATION 1\n#define HAVE_COREAUDIO 1\n#de
 xcrun --sdk macosx clang -x objective-c -std=c11 -fno-objc-arc -Wall -Wno-unused-parameter \
     -I"$workdir" -I"$source_dir" -I"$source_dir/include" \
     "$root/scripts/test_ao_avfoundation_fallback.m" \
-    -framework AVFoundation -framework CoreMedia -framework Foundation \
+    -framework AVFoundation -framework CoreAudio -framework CoreMedia -framework Foundation \
     -o "$workdir/test"
 "$workdir/test"

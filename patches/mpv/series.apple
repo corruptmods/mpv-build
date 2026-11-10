@@ -42,3 +42,7 @@
 # interruption and route-change handling (tests test_ao_avfoundation_stall.sh,
 # test_ao_avfoundation_fallback.sh).
 0302-avfoundation-supervise-the-passthrough-sink-mid-stream.patch
+# A codec whose passthrough failed mid-stream is decoded to PCM on this
+# player until the audio route changes (--audio-spdif-backoff; test
+# test_audio_passthrough_fallback.sh).
+0303-player-back-off-passthrough-for-a-codec-that-failed-on-this-route.patch
