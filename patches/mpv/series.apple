@@ -46,3 +46,6 @@
 # player until the audio route changes (--audio-spdif-backoff; test
 # test_audio_passthrough_fallback.sh).
 0303-player-back-off-passthrough-for-a-codec-that-failed-on-this-route.patch
+# 0025's recovery as --hwdec-recover-keyframes/--hwdec-recover-max-frames,
+# defaults unchanged (test test_hwdec_recovery.sh).
+0306-vd-lavc-options-for-the-hwdec-error-recovery.patch

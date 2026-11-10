@@ -124,6 +124,8 @@ jobs:
                 subprocess.run(['bash', 'scripts/test_osd_sub_schedule_lock.sh', str(dest)], check=True)
                 # --sub-ass-render-threads reaching ass_set_threads().
                 subprocess.run(['bash', 'scripts/test_sub_ass_render_threads.sh', str(dest)], check=True)
+                # 0025's hwdec error recovery and its options (0306).
+                subprocess.run(['bash', 'scripts/test_hwdec_recovery.sh', str(dest)], check=True)
               if component == 'ffmpeg' and group == 'apple':
                 # VideoToolbox's Dolby Vision profile 7 mode: plain C, stub types.
                 subprocess.run(['bash', 'scripts/test_vt_dovi_conversion_mode.sh', str(dest)], check=True)

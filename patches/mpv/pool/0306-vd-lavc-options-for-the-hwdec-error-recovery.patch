@@ -1,0 +1,114 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: [PATCH] vd_lavc: options for the hwdec error recovery
+
+0025 changed what --hwdec-software-fallback means mid-stream with two
+constants: once a hardware decoder has delivered frames, a decode-error
+burst falls back to software only after it has run through two keyframes
+or 240 errored frames. Nothing could set them, and nothing could restore
+upstream mpv's fallback at the configured error count.
+
+--hwdec-recover-keyframes=<0-64> (default 2) and
+--hwdec-recover-max-frames=<1-100000> (default 240) replace them; the
+defaults are 0025's values, so nothing changes unless they are set.
+--hwdec-recover-keyframes=0 is upstream mpv's behaviour. Probing still
+falls back at --hwdec-software-fallback, and --hwdec-software-fallback=no
+still never does. Both are documented beside --hwdec-software-fallback.
+
+scripts/test_hwdec_recovery.sh compiles handle_err() with the shipped
+defaults and counts the errored frames to a fallback for each case.
+
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index c39ab4f..749420d 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -1898,6 +1898,20 @@ Video
+     the number of packets that could not be decoded. Values below an unspecified
+     count will not have this problem, because mpv retains the packets.
+ 
++``--hwdec-recover-keyframes=<0-64>``
++    Once a hardware decoder has delivered frames, how many keyframes a burst
++    of decode errors may run through before the software fallback (default:
++    2). A frame the hardware refuses poisons every frame that references it,
++    so such a burst usually ends at the next keyframe. ``0`` falls back as
++    soon as ``--hwdec-software-fallback`` errors are reached, as upstream mpv
++    does. While the decoder is first being probed, the fallback is never
++    held back.
++
++``--hwdec-recover-max-frames=<1-100000>``
++    The longest such burst, in errored frames, before the software fallback
++    whatever the keyframe count (default: 240), for streams without regular
++    keyframes.
++
+ ``--vd-lavc-check-hw-profile=<yes|no>``
+     Check hardware decoder profile (default: yes). If ``no`` is set, the
+     highest profile of the hardware decoder is unconditionally selected, and
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 58b9bcd..455877e 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -143,6 +143,8 @@ const struct m_sub_options vd_lavc_conf = {
+ 
+ struct hwdec_opts {
+     int software_fallback;
++    int recover_keyframes;
++    int recover_max_frames;
+     char **hwdec_api;
+     char *hwdec_codecs;
+     int hwdec_image_format;
+@@ -165,12 +167,17 @@ const struct m_sub_options hwdec_conf = {
+             {"no", INT_MAX}, {"yes", 1}), M_RANGE(1, INT_MAX),
+             .flags = UPDATE_HWDEC},
+         {"hwdec-threads", OPT_INT(hwdec_threads), M_RANGE(0, DBL_MAX)},
++        // 0025's mid-stream recovery; see handle_err().
++        {"hwdec-recover-keyframes", OPT_INT(recover_keyframes), M_RANGE(0, 64)},
++        {"hwdec-recover-max-frames", OPT_INT(recover_max_frames), M_RANGE(1, 100000)},
+         {"vd-lavc-software-fallback", OPT_REPLACED("hwdec-software-fallback")},
+         {0}
+     },
+     .size = sizeof(struct hwdec_opts),
+     .defaults = &(const struct hwdec_opts){
+         .software_fallback = 3,
++        .recover_keyframes = 2,
++        .recover_max_frames = 240,
+         .hwdec_api = (char *[]){"no", NULL,},
+         .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx",
+         // Maximum number of surfaces the player wants to buffer. This number
+@@ -1176,15 +1183,16 @@ static void prepare_decoding(struct mp_filter *vd)
+         reset_avctx(vd);
+ }
+ 
+-// Give a previously working hwdec this many keyframes to shake off a
+-// decode-error burst before falling back to software. One frame the hardware
+-// refuses to decode poisons every frame that references it, so the burst
+-// normally runs exactly until the next keyframe and then heals (observed with
+-// VideoToolbox rejecting a single conformant HEVC frame, plezy issue #2167).
+-#define HWDEC_ERR_RECOVER_KEYFRAMES 2
+-// Absolute burst ceiling so a stream without regular keyframes (e.g. intra
+-// refresh) still reaches the software fallback instead of freezing forever.
+-#define HWDEC_ERR_MAX_RUN 240
++// Give a previously working hwdec --hwdec-recover-keyframes keyframes (default
++// 2) to shake off a decode-error burst before falling back to software. One
++// frame the hardware refuses to decode poisons every frame that references
++// it, so the burst normally runs exactly until the next keyframe and then
++// heals (observed with VideoToolbox rejecting a single conformant HEVC frame,
++// plezy issue #2167). 0 falls back at --hwdec-software-fallback errors, as
++// upstream mpv does.
++// --hwdec-recover-max-frames (default 240) is the absolute burst ceiling, so
++// a stream without regular keyframes (e.g. intra refresh) still reaches the
++// software fallback instead of freezing forever.
+ 
+ static void handle_err(struct mp_filter *vd)
+ {
+@@ -1206,8 +1214,8 @@ static void handle_err(struct mp_filter *vd)
+     // are content-triggered rather than a broken decoder: hold the fallback
+     // until the burst survives whole keyframe intervals.
+     if (!ctx->hwdec_notified ||
+-        ctx->hwdec_err_keyframes >= HWDEC_ERR_RECOVER_KEYFRAMES ||
+-        ctx->hwdec_fail_count >= HWDEC_ERR_MAX_RUN)
++        ctx->hwdec_err_keyframes >= hwdec_opts->recover_keyframes ||
++        ctx->hwdec_fail_count >= hwdec_opts->recover_max_frames)
+         ctx->hwdec_failed = true;
+ }
+ 
