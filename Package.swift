@@ -150,7 +150,7 @@ let package = Package(
 
         .binaryTarget(
             name: "Libdav1d",
-            url: "https://github.com/edde746/libdav1d-build/releases/download/1.5.3-neon/Libdav1d.xcframework.zip",
+            url: "https://github.com/corruptmods/mpv-build/releases/download/binaries-apple/Libdav1d-1.5.3-neon.xcframework.zip",
             checksum: "7965ecf274af5448fa830bc1fec4e78257cf1d7509ed1cd95e32023b7bdff965"
         ),
 
