@@ -1,0 +1,310 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: [PATCH] videotoolbox: Dolby Vision profile 7 mode as a decoder AVOption
+
+Patch 0003 read getenv("PLEZY_DV_CONVERSION_MODE") inside libavcodec on
+every slice and every session-format query: a process-global setting with
+no API, read on the decode path.
+
+The HEVC decoder gets a private AVOption, dv_conversion_mode
+(unset|auto|disabled|dv81|hevc_strip, default unset). ff_videotoolbox_
+common_init() resolves it once into the hwaccel context; with the option
+unset it reads the environment once there instead, PLUET_DV_CONVERSION_MODE
+before PLEZY_DV_CONVERSION_MODE, with the same values and aliases as
+before, so embedders that set the variable keep working. With neither set
+the mode is auto, as before. The helpers that read the mode take the codec
+context instead of calling getenv().
+
+Every VideoToolbox hwaccel shares that init, and VP9's and ProRes's
+priv_data do not start with an AVClass, so the option is only looked up for
+HEVC, and through the codec context with AV_OPT_SEARCH_CHILDREN, which
+descends into priv_data only when the codec has a priv_class. Other codecs
+resolve to auto without reading the environment.
+
+scripts/test_vt_dovi_conversion_mode.sh compiles the resolution code and
+the option's table lines against stub FFmpeg types, then runs the resolution
+against a real minimal libavcodec with opened HEVC, H.264, VP9 and ProRes
+decoders, the last two with a wild first pointer in priv_data, which a
+lookup on priv_data dereferences.
+
+
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index e916a1a..651401b 100644
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -4225,6 +4225,18 @@ static const AVOption options[] = {
+         { "unspecified", .type = AV_OPT_TYPE_CONST, .default_val = { .i64 = AV_STEREO3D_VIEW_UNSPEC }, .unit = "view_pos" },
+         { "left",        .type = AV_OPT_TYPE_CONST, .default_val = { .i64 = AV_STEREO3D_VIEW_LEFT },   .unit = "view_pos" },
+         { "right",       .type = AV_OPT_TYPE_CONST, .default_val = { .i64 = AV_STEREO3D_VIEW_RIGHT },  .unit = "view_pos" },
++    { "dv_conversion_mode", "Dolby Vision profile 7 handling under VideoToolbox",
++        OFFSET(dv_conversion_mode), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 3, PAR, .unit = "dv_conversion_mode" },
++        { "unset",      "PLUET_DV_CONVERSION_MODE or PLEZY_DV_CONVERSION_MODE, else auto",
++                        0, AV_OPT_TYPE_CONST, { .i64 = -1 }, 0, 0, PAR, .unit = "dv_conversion_mode" },
++        { "auto",       "convert to profile 8.1 where libdovi is linked",
++                        0, AV_OPT_TYPE_CONST, { .i64 = 0 },  0, 0, PAR, .unit = "dv_conversion_mode" },
++        { "disabled",   "hand profile 7 to VideoToolbox as it is",
++                        0, AV_OPT_TYPE_CONST, { .i64 = 1 },  0, 0, PAR, .unit = "dv_conversion_mode" },
++        { "dv81",       "convert to profile 8.1",
++                        0, AV_OPT_TYPE_CONST, { .i64 = 2 },  0, 0, PAR, .unit = "dv_conversion_mode" },
++        { "hevc_strip", "drop the RPUs and decode the base layer as HEVC",
++                        0, AV_OPT_TYPE_CONST, { .i64 = 3 },  0, 0, PAR, .unit = "dv_conversion_mode" },
+ 
+     { NULL },
+ };
+diff --git a/libavcodec/hevc/hevcdec.h b/libavcodec/hevc/hevcdec.h
+index 911d5c3..6a327d7 100644
+--- a/libavcodec/hevc/hevcdec.h
++++ b/libavcodec/hevc/hevcdec.h
+@@ -564,6 +564,10 @@ typedef struct HEVCContext {
+                             ///< as a format defined in 14496-15
+     int apply_defdispwin;
+ 
++    // Dolby Vision profile 7 handling under VideoToolbox (dv_conversion_mode);
++    // -1 leaves it to the environment, read once at hwaccel init.
++    int dv_conversion_mode;
++
+     // multi-layer AVOptions
+     int         *view_ids;
+     unsigned  nb_view_ids;
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index d2c10f9..a0411be 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -30,6 +30,7 @@
+ #include "libavutil/dovi_meta.h"
+ #include "libavutil/mastering_display_metadata.h"
+ #include "libavutil/mem.h"
++#include "libavutil/opt.h"
+ #include "vt_internal.h"
+ #include "libavutil/avutil.h"
+ #include "libavutil/hwcontext.h"
+@@ -862,14 +863,16 @@ static const AVDOVIDecoderConfigurationRecord *videotoolbox_dovi_get_conf(AVCode
+     return (const AVDOVIDecoderConfigurationRecord *)sd->data;
+ }
+ 
+-static int videotoolbox_dovi_needs_p81_conversion(const AVDOVIDecoderConfigurationRecord *dovi);
++static int videotoolbox_dovi_needs_p81_conversion(AVCodecContext *avctx,
++                                                  const AVDOVIDecoderConfigurationRecord *dovi);
+ 
+-static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecord *dovi)
++static int videotoolbox_dovi_is_apple_hevc(AVCodecContext *avctx,
++                                           const AVDOVIDecoderConfigurationRecord *dovi)
+ {
+     if (!dovi || !dovi->rpu_present_flag || !dovi->bl_present_flag)
+         return 0;
+ 
+-    if (videotoolbox_dovi_needs_p81_conversion(dovi))
++    if (videotoolbox_dovi_needs_p81_conversion(avctx, dovi))
+         return 1;
+ 
+     switch (dovi->dv_profile) {
+@@ -920,7 +923,7 @@ static void videotoolbox_dovi_tag_output_attachments(AVCodecContext *avctx,
+     if (!videotoolbox_session_is_dovi(avctx))
+         return;
+ 
+-    if (!videotoolbox_dovi_is_apple_hevc(dovi) ||
++    if (!videotoolbox_dovi_is_apple_hevc(avctx, dovi) ||
+         !videotoolbox_dovi_has_hdr_compatible_base(dovi))
+         return;
+ 
+@@ -953,17 +956,17 @@ static void videotoolbox_dovi_tag_output_attachments(AVCodecContext *avctx,
+     CFRelease(colorspace);
+ }
+ 
++// --- vt dovi conversion mode
++// The values of the HEVC decoder's dv_conversion_mode option.
+ enum PlezyDoviConversionMode {
+-    PLEZY_DOVI_AUTO,
+-    PLEZY_DOVI_DISABLED,
+-    PLEZY_DOVI_DV81,
+-    PLEZY_DOVI_HEVC_STRIP,
++    PLEZY_DOVI_AUTO = 0,
++    PLEZY_DOVI_DISABLED = 1,
++    PLEZY_DOVI_DV81 = 2,
++    PLEZY_DOVI_HEVC_STRIP = 3,
+ };
+ 
+-static enum PlezyDoviConversionMode videotoolbox_dovi_conversion_mode(void)
++static enum PlezyDoviConversionMode videotoolbox_dovi_env_mode(const char *mode)
+ {
+-    const char *mode = getenv("PLEZY_DV_CONVERSION_MODE");
+-
+     if (!mode || !mode[0] || !strcmp(mode, "auto"))
+         return PLEZY_DOVI_AUTO;
+     if (!strcmp(mode, "dv81") || !strcmp(mode, "p8") ||
+@@ -978,45 +981,90 @@ static enum PlezyDoviConversionMode videotoolbox_dovi_conversion_mode(void)
+     return PLEZY_DOVI_AUTO;
+ }
+ 
+-static int videotoolbox_dovi_needs_p81_conversion(const AVDOVIDecoderConfigurationRecord *dovi)
++// Once per hwaccel init: the decoder's dv_conversion_mode AVOption, or with
++// it unset (-1, its default) the environment, which embedders set before the
++// option existed: PLUET_DV_CONVERSION_MODE, else PLEZY_DV_CONVERSION_MODE.
++//
++// Every VideoToolbox hwaccel runs this init, and only HEVC has the option or
++// a use for it. Not every decoder's priv_data starts with an AVClass (VP9's
++// and ProRes's do not), so the option is looked up through the codec context
++// with AV_OPT_SEARCH_CHILDREN, which descends into priv_data only when the
++// codec has a priv_class (codec_child_next() in options.c).
++static void videotoolbox_dovi_resolve_mode(AVCodecContext *avctx, VTContext *vtctx)
++{
++    int64_t opt = -1;
++    const char *name = NULL, *env = NULL;
++
++    vtctx->dovi_mode = PLEZY_DOVI_AUTO;
++    if (avctx->codec_id != AV_CODEC_ID_HEVC)
++        return;
++    if (av_opt_get_int(avctx, "dv_conversion_mode", AV_OPT_SEARCH_CHILDREN, &opt) < 0)
++        opt = -1;
++    if (opt >= PLEZY_DOVI_AUTO && opt <= PLEZY_DOVI_HEVC_STRIP) {
++        vtctx->dovi_mode = opt;
++        return;
++    }
++    if ((env = getenv("PLUET_DV_CONVERSION_MODE")) && env[0])
++        name = "PLUET_DV_CONVERSION_MODE";
++    else if ((env = getenv("PLEZY_DV_CONVERSION_MODE")) && env[0])
++        name = "PLEZY_DV_CONVERSION_MODE";
++    vtctx->dovi_mode = videotoolbox_dovi_env_mode(name ? env : NULL);
++    if (name)
++        av_log(avctx, AV_LOG_VERBOSE, "Dolby Vision conversion mode %d from %s=%s\n",
++               vtctx->dovi_mode, name, env);
++}
++
++static enum PlezyDoviConversionMode videotoolbox_dovi_conversion_mode(AVCodecContext *avctx)
++{
++    VTContext *vtctx = avctx->internal->hwaccel_priv_data;
++
++    return vtctx ? vtctx->dovi_mode : PLEZY_DOVI_AUTO;
++}
++// --- end vt dovi conversion mode
++
++static int videotoolbox_dovi_needs_p81_conversion(AVCodecContext *avctx,
++                                                  const AVDOVIDecoderConfigurationRecord *dovi)
+ {
+-    enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode();
++    enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode(avctx);
+ 
+     return dovi && dovi->dv_profile == 7 &&
+            dovi->rpu_present_flag && dovi->bl_present_flag &&
+            (mode == PLEZY_DOVI_AUTO || mode == PLEZY_DOVI_DV81);
+ }
+ 
+-static int videotoolbox_dovi_needs_hevc_strip(const AVDOVIDecoderConfigurationRecord *dovi)
++static int videotoolbox_dovi_needs_hevc_strip(AVCodecContext *avctx,
++                                              const AVDOVIDecoderConfigurationRecord *dovi)
+ {
+-    enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode();
++    enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode(avctx);
+ 
+     return dovi && dovi->dv_profile == 7 &&
+            dovi->rpu_present_flag && dovi->bl_present_flag &&
+            mode == PLEZY_DOVI_HEVC_STRIP;
+ }
+ 
+-static int videotoolbox_dovi_effective_profile(const AVDOVIDecoderConfigurationRecord *dovi)
++static int videotoolbox_dovi_effective_profile(AVCodecContext *avctx,
++                                               const AVDOVIDecoderConfigurationRecord *dovi)
+ {
+     if (!dovi)
+         return 0;
+ 
+-    return videotoolbox_dovi_needs_p81_conversion(dovi) ? 8 : dovi->dv_profile;
++    return videotoolbox_dovi_needs_p81_conversion(avctx, dovi) ? 8 : dovi->dv_profile;
+ }
+ 
+-static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigurationRecord *dovi)
++static CFDataRef videotoolbox_dovi_extradata_create(AVCodecContext *avctx,
++                                                    const AVDOVIDecoderConfigurationRecord *dovi)
+ {
+     uint8_t buf[24] = { 0 };
+     uint16_t flags;
+     int profile, el_present, bl_compatibility_id;
+ 
+-    if (!videotoolbox_dovi_is_apple_hevc(dovi))
++    if (!videotoolbox_dovi_is_apple_hevc(avctx, dovi))
+         return NULL;
+ 
+-    profile = videotoolbox_dovi_effective_profile(dovi);
++    profile = videotoolbox_dovi_effective_profile(avctx, dovi);
+     el_present = dovi->el_present_flag;
+     bl_compatibility_id = dovi->dv_bl_signal_compatibility_id;
+-    if (videotoolbox_dovi_needs_p81_conversion(dovi)) {
++    if (videotoolbox_dovi_needs_p81_conversion(avctx, dovi)) {
+         el_present = 0;
+         bl_compatibility_id = 1;
+     }
+@@ -1162,10 +1210,10 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
+             CFDictionarySetValue(avc_info, CFSTR("hvcC"), data);
+         if (codec_type == kCMVideoCodecType_DolbyVisionHEVC_FF) {
+             dovi = videotoolbox_dovi_get_conf(avctx);
+-            dovi_data = videotoolbox_dovi_extradata_create(dovi);
++            dovi_data = videotoolbox_dovi_extradata_create(avctx, dovi);
+             if (dovi_data)
+                 CFDictionarySetValue(avc_info,
+-                                     videotoolbox_dovi_effective_profile(dovi) > 7 ? CFSTR("dvvC") : CFSTR("dvcC"),
++                                     videotoolbox_dovi_effective_profile(avctx, dovi) > 7 ? CFSTR("dvvC") : CFSTR("dvcC"),
+                                      dovi_data);
+         }
+         break;
+@@ -1252,9 +1300,9 @@ static int videotoolbox_start(AVCodecContext *avctx)
+         {
+             const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
+ 
+-            if (videotoolbox_dovi_is_apple_hevc(dovi)) {
++            if (videotoolbox_dovi_is_apple_hevc(avctx, dovi)) {
+                 videotoolbox->cm_codec_type = kCMVideoCodecType_DolbyVisionHEVC_FF;
+-                if (videotoolbox_dovi_needs_p81_conversion(dovi)) {
++                if (videotoolbox_dovi_needs_p81_conversion(avctx, dovi)) {
+                     av_log(avctx, AV_LOG_VERBOSE,
+                            "Converting Dolby Vision profile 7 to profile 8.1 "
+                            "for VideoToolbox.\n");
+@@ -1576,8 +1624,8 @@ static int videotoolbox_hevc_decode_slice(AVCodecContext *avctx,
+ {
+     const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
+ 
+-    if (videotoolbox_dovi_needs_p81_conversion(dovi) ||
+-        videotoolbox_dovi_needs_hevc_strip(dovi))
++    if (videotoolbox_dovi_needs_p81_conversion(avctx, dovi) ||
++        videotoolbox_dovi_needs_hevc_strip(avctx, dovi))
+         return videotoolbox_hevc_decode_dovi_slice(avctx, buffer, size);
+ 
+     return videotoolbox_common_decode_slice(avctx, buffer, size);
+@@ -1587,12 +1635,12 @@ static int videotoolbox_hevc_append_dovi_rpus(AVCodecContext *avctx)
+ {
+     HEVCContext *h = avctx->priv_data;
+     const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
+-    int convert_p7 = videotoolbox_dovi_needs_p81_conversion(dovi);
++    int convert_p7 = videotoolbox_dovi_needs_p81_conversion(avctx, dovi);
+ 
+     if (!videotoolbox_session_is_dovi(avctx))
+         return 0;
+ 
+-    if (!videotoolbox_dovi_is_apple_hevc(dovi))
++    if (!videotoolbox_dovi_is_apple_hevc(avctx, dovi))
+         return 0;
+ 
+     for (int i = 0; i < h->pkt.nb_nals; i++) {
+@@ -1757,6 +1805,7 @@ int ff_videotoolbox_common_init(AVCodecContext *avctx)
+     bool full_range;
+ 
+     vtctx->logctx = avctx;
++    videotoolbox_dovi_resolve_mode(avctx, vtctx);
+ 
+     if (!avctx->hw_frames_ctx && !avctx->hw_device_ctx &&
+             avctx->hwaccel_context)
+diff --git a/libavcodec/vt_internal.h b/libavcodec/vt_internal.h
+index b1eb073..5181aff 100644
+--- a/libavcodec/vt_internal.h
++++ b/libavcodec/vt_internal.h
+@@ -47,6 +47,11 @@ typedef struct VTContext {
+     bool                        reconfig_needed;
+ 
+     void *logctx;
++
++    // Dolby Vision profile 7 handling (enum PlezyDoviConversionMode), from
++    // the HEVC decoder's dv_conversion_mode or, unset, the environment;
++    // resolved once in ff_videotoolbox_common_init().
++    int dovi_mode;
+ } VTContext;
+ 
+ int ff_videotoolbox_alloc_frame(AVCodecContext *avctx, AVFrame *frame);

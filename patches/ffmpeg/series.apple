@@ -22,3 +22,8 @@
 # The NAL unescape scan, VideoToolbox's largest FFmpeg leaf at high bitrates;
 # builds without NEON or fast 64-bit loads keep the original scan.
 0041-h2645-find-escapes-and-start-codes-a-zero-pair-at-a-time.patch
+# Pluet (corruptmods) patches, 03xx, on top of everything above.
+# The profile 7 mode is the HEVC decoder's dv_conversion_mode AVOption, the
+# environment read once at init when it is unset (test
+# test_vt_dovi_conversion_mode.sh).
+0300-videotoolbox-dolby-vision-profile-7-mode-as-a-decoder-avoption.patch

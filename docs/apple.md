@@ -67,6 +67,18 @@ that track to PCM and seeks back to the playback position. The fallback
 belongs to the track: the next track or file, or a later output reload, tries
 passthrough again. Patches 0040-0042 carry the details.
 
+## Dolby Vision profile 7
+
+VideoToolbox takes profile 8.1, so FFmpeg converts a profile 7 stream's RPUs
+through libdovi by default. The HEVC decoder's `dv_conversion_mode` AVOption
+picks the handling: `auto` (the default), `dv81`, `hevc_strip` (drop the RPUs,
+decode the base layer as HEVC) or `disabled` (hand profile 7 over unchanged).
+From mpv, `--vd-lavc-dv-conversion=<default|auto|disabled|dv81|hevc-strip>`
+sets it on the decoders that have it, and
+`--vd-lavc-o=dv_conversion_mode=<value>` sets it too. Left unset, FFmpeg reads
+`PLUET_DV_CONVERSION_MODE`, else `PLEZY_DV_CONVERSION_MODE`, once when the
+hardware decoder opens (FFmpeg patch 0300, mpv patch 0301).
+
 ## Spatial audio (`ao=spatial`)
 
 `ao_spatial` (patch 0039) plays TrueHD Atmos and DTS:X by handing mpv's IEC

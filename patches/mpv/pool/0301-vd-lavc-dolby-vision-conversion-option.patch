@@ -1,0 +1,87 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: [PATCH] vd_lavc: --vd-lavc-dv-conversion for VideoToolbox Dolby Vision
+
+FFmpeg patch 0300 gives the HEVC decoder a dv_conversion_mode AVOption.
+--vd-lavc-o=dv_conversion_mode=... reaches it, but mp_set_avopts() logs an
+error for every other decoder, so an embedder could not set it once for
+all files. --vd-lavc-dv-conversion sets it for the HEVC decoder only, through the
+codec context with AV_OPT_SEARCH_CHILDREN (which reaches priv_data only
+when the codec has a priv_class), and is ignored for the rest; --vd-lavc-o,
+applied after it, still overrides. The
+default leaves the AVOption unset, so the environment fallback and auto
+behave as before.
+
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 97ad814..666f01e 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -1956,6 +1956,20 @@ Video
+ 
+         ``--vd-lavc-o=debug=pict``
+ 
++``--vd-lavc-dv-conversion=<default|auto|disabled|dv81|hevc-strip>``
++    How VideoToolbox decodes Dolby Vision profile 7 HEVC (Apple platforms;
++    sets the HEVC decoder's ``dv_conversion_mode`` AVOption, which
++    ``--vd-lavc-o=dv_conversion_mode=<value>`` also sets, with ``hevc_strip``
++    spelled with an underscore there). Other decoders ignore it.
++
++    :default:    Leave it to the environment, read once when the hardware
++                 decoder opens: ``PLUET_DV_CONVERSION_MODE``, else
++                 ``PLEZY_DV_CONVERSION_MODE``, else ``auto`` (the default).
++    :auto:       Convert the RPUs to profile 8.1 where FFmpeg links libdovi.
++    :dv81:       Convert to profile 8.1.
++    :hevc-strip: Drop the RPUs and decode the base layer as plain HEVC.
++    :disabled:   Hand profile 7 to VideoToolbox unchanged.
++
+ ``--vd-lavc-show-all=<yes|no>``
+     Show even broken/corrupt frames (default: no). If this option is set to
+     no, libavcodec won't output frames that were either decoded before an
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 202f726..58b9bcd 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -84,6 +84,7 @@ struct vd_lavc_params {
+     bool check_hw_profile;
+     char **avopts;
+     int dr;
++    int dv_conversion;
+ };
+ 
+ static const struct m_opt_choice_alternatives discard_names[] = {
+@@ -115,6 +116,11 @@ const struct m_sub_options vd_lavc_conf = {
+         {"vd-lavc-dr", OPT_CHOICE(dr,
+             {"auto", -1}, {"no", 0}, {"yes", 1})},
+         {"vd-apply-cropping", OPT_BOOL(apply_cropping)},
++        // The values of the HEVC decoder's dv_conversion_mode AVOption
++        // (FFmpeg patch 0300); "default" leaves it unset.
++        {"vd-lavc-dv-conversion", OPT_CHOICE(dv_conversion,
++            {"default", -1}, {"auto", 0}, {"disabled", 1}, {"dv81", 2},
++            {"hevc-strip", 3})},
+         {0}
+     },
+     .change_flags = UPDATE_VD,
+@@ -128,6 +134,7 @@ const struct m_sub_options vd_lavc_conf = {
+         .framedrop = AVDISCARD_NONREF,
+         .dr = -1,
+         .apply_cropping = true,
++        .dv_conversion = -1,
+     },
+ };
+ 
+@@ -845,6 +852,14 @@ static void init_avctx(struct mp_filter *vd)
+         break;
+     }
+ 
++    // Only FFmpeg's HEVC decoder has the option (patch 0300). Set through the
++    // codec context: AV_OPT_SEARCH_CHILDREN reaches priv_data only when the
++    // codec has a priv_class, and not every decoder's priv_data starts with
++    // an AVClass. Before --vd-lavc-o, which can override it.
++    if (lavc_param->dv_conversion >= 0 && lavc_codec->id == AV_CODEC_ID_HEVC &&
++        av_opt_set_int(avctx, "dv_conversion_mode", lavc_param->dv_conversion,
++                       AV_OPT_SEARCH_CHILDREN) >= 0)
++        MP_VERBOSE(vd, "Dolby Vision conversion mode %d\n", lavc_param->dv_conversion);
+     mp_set_avopts(vd->log, avctx, lavc_param->avopts);
+ 
+     // Do this after the above avopt handling in case it changes values

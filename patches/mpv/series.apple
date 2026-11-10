@@ -36,3 +36,5 @@
 # vo_avfoundation never waits on the main thread at teardown, and at most
 # 500 ms anywhere else (test test_avf_main_thread_link.sh).
 0300-avfoundation-never-wait-on-the-main-thread-at-teardown.patch
+# --vd-lavc-dv-conversion sets FFmpeg 0300's dv_conversion_mode.
+0301-vd-lavc-dolby-vision-conversion-option.patch

@@ -118,6 +118,9 @@ jobs:
                 # The player's half of the passthrough fallback: plain C, no
                 # Apple frameworks.
                 subprocess.run(['bash', 'scripts/test_audio_passthrough_fallback.sh', str(dest)], check=True)
+              if component == 'ffmpeg' and group == 'apple':
+                # VideoToolbox's Dolby Vision profile 7 mode: plain C, stub types.
+                subprocess.run(['bash', 'scripts/test_vt_dovi_conversion_mode.sh', str(dest)], check=True)
               if component == 'mpv' and group == 'android':
                 subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_audiotrack_truehd.sh', str(dest)], check=True)
