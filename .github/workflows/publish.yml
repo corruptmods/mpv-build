@@ -92,6 +92,11 @@ jobs:
       - name: Test build input verification
         run: bash ./scripts/test_build_inputs.sh
 
+      # FFmpeg 0042's NEON inverse MDCT against the C transform: checkasm's
+      # av_tx test and the strided path it misses. macos-26 is arm64.
+      - name: Test NEON inverse MDCT
+        run: bash ./scripts/test_tx_neon_imdct.sh
+
       - name: Test AVFoundation timebase servo
         run: ./scripts/test_avf_timebase_servo.sh
 

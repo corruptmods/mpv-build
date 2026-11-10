@@ -204,6 +204,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_apple_merge.sh` | `merge_xcframeworks.py` writes byte-identical zips twice (macOS) | main |
 | `test_build_date.sh <asset>...` | no file in a release asset carries its build's clock; every build leg runs it before upload | main, android.yml |
 | `test_build_process.sh` | the Swift driver's process launch: output capture and exit codes | main |
+| `test_tx_neon_imdct.sh` | FFmpeg 0042's NEON inverse MDCT matches the C transform: checkasm `av_tx`, and strides 1-8 floats at codec lengths (aarch64 host; builds a minimal libavutil, ~2 min) | main |
 | `test_build_inputs.sh` | the Swift driver refuses a clone not at its recorded commit and a prebuilt without a matching sha256, and every apple pin has one (macOS) | main |
 | `platforms/linux/test.sh` | the linux driver's build plan and configure flags, all tools stubbed | PR |
 | `platforms/windows/test_pin_packages.py` (python3) | `pin_packages.py` rewrites winbuild's packages onto the pins | PR |
