@@ -249,6 +249,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_mediacodec_shed.sh` | pre-decode frame shedding for H.264, HEVC, VP9 and AV1 | PR, main |
 | `test_mediacodec_timing.sh` | vo_mediacodec cadence, vsync snapping, release timing, present stats | PR, main |
 | `test_mediacodec_vsync.sh` | the Choreographer vsync sampler against Android 11's behaviour | PR, main |
+| `test_osd_sub_schedule_lock.sh` | the OSD's subtitle schedule query keeps osd->lock free while a dec_sub renders, and pins the dec_subs against a swap; a stress run (patch 0304) | PR |
 | `test_pgs_palette.sh` | PGS palettes start transparent after an epoch boundary | PR, main |
 | `test_player_queue_frames.sh` | frame queueing and durations under vo_mediacodec | PR, main |
 | `test_player_release_held_frame.sh` | ending a file frees the decoder before the next opens (patch 0139) | PR, main |

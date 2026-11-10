@@ -1,0 +1,76 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: [PATCH] osd: ask for the subtitle schedule without holding the OSD
+ lock
+
+osd_get_sub_schedule() (0011) held osd->lock while it called
+sub_get_next_event_start() and sub_get_visible_end(), and both wait in
+wait_render_done() for a render of their dec_sub that is in progress, which
+takes as long as libass does. The playloop's osd_set_text() and every other
+OSD call waited behind it: what 0009 took the libass render out of osd->lock
+to avoid.
+
+The subtitle objects are now pinned the way osd_render() pins them for its
+render (0009): under the lock, wait for any render that has them pinned,
+take the two dec_sub pointers and set sub_render_busy, then query them with
+the lock released, and take it again to clear the flag and wake waiters.
+osd_set_sub() and osd_free() already wait for that flag, so neither dec_sub
+can be swapped or freed while it is queried. Lock order is 0009's: osd->lock
+is never held while a dec_sub lock is taken here. The answer is unchanged.
+
+scripts/test_osd_sub_schedule_lock.sh compiles the function with
+osd_set_sub() against fake dec_sub queries that block like a render: the
+lock stays free during a blocked query, a swap waits for it, and a stress
+run of queries, swaps and lock users finds no use of a swapped-out dec_sub.
+The old code fails its lock check.
+
+
+diff --git a/sub/osd.c b/sub/osd.c
+index c6b7ce3..c35f88a 100644
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -308,9 +308,27 @@ void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
+     *next_start = MP_NOPTS_VALUE;
+     *next_events = 0;
+     *visible_end = MP_NOPTS_VALUE;
++
++    // Both queries wait for a render of their dec_sub that is in progress
++    // (wait_render_done), which can take as long as libass does. Holding
++    // osd->lock meanwhile would stall the playloop's osd_set_text() and
++    // every other OSD call behind a subtitle render. So pin the subtitle
++    // objects the way osd_render() does (sub_render_busy: osd_set_sub() and
++    // osd_free() wait for it, so neither dec_sub can be swapped or freed),
++    // and ask them with the lock released. Same order as 0009's render:
++    // osd->lock is never held while a dec_sub lock is taken here.
++    struct dec_sub *subs[2] = {0};
+     mp_mutex_lock(&osd->lock);
+-    for (int n = OSDTYPE_SUB; n <= OSDTYPE_SUB2; n++) {
+-        struct dec_sub *sub = osd->objs[n]->sub;
++    wait_sub_render_done(osd);
++    for (int n = OSDTYPE_SUB; n <= OSDTYPE_SUB2; n++)
++        subs[n - OSDTYPE_SUB] = osd->objs[n]->sub;
++    bool pinned = subs[0] || subs[1];
++    if (pinned)
++        osd->sub_render_busy = true;
++    mp_mutex_unlock(&osd->lock);
++
++    for (int n = 0; n < 2; n++) {
++        struct dec_sub *sub = subs[n];
+         if (!sub)
+             continue;
+         int events = 0;
+@@ -325,7 +343,13 @@ void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
+         }
+         *visible_end = MP_PTS_MIN(*visible_end, sub_get_visible_end(sub, pts));
+     }
+-    mp_mutex_unlock(&osd->lock);
++
++    if (pinned) {
++        mp_mutex_lock(&osd->lock);
++        osd->sub_render_busy = false;
++        mp_cond_broadcast(&osd->sub_render_done);
++        mp_mutex_unlock(&osd->lock);
++    }
+ }
+ 
+ void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)

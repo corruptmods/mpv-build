@@ -49,3 +49,7 @@
 # keeps its packed atlas (and atlas_id), and new atlases come from a small
 # pool of free ones (--sub-ass-atlas-reuse, --sub-ass-atlas-pool).
 0215-sub-keep-the-ass-atlas-when-only-positions-or-colors-change.patch
+# Pluet (corruptmods) patches, 03xx, on top of everything above.
+# osd_get_sub_schedule() no longer holds osd->lock while its dec_sub queries
+# wait for a render (test test_osd_sub_schedule_lock.sh).
+0304-osd-ask-for-the-subtitle-schedule-without-holding-the-osd-lock.patch
