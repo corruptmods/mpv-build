@@ -1,0 +1,81 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: [PATCH] sd_ass: --sub-ass-render-threads
+
+0205 calls ass_set_threads(renderer, 0) for every renderer, so libass
+renders each frame with as many threads as there are logical cores, through
+the threaded renderer of libass patch 0003, with no way for an embedder to
+rule that path out or keep subtitle rendering off other cores.
+
+--sub-ass-render-threads=<auto|1-64> is what get_renderer() passes; auto is
+0, so the default is 0205's behaviour. 1 renders on the calling thread
+only. A change reinitializes the subtitle decoder (UPDATE_SUB_HARD), so it
+reaches the renderers it creates.
+
+scripts/test_sub_ass_render_threads.sh compiles get_renderer() against
+fakes and checks the value libass gets for the default, 1 and 4, and the
+option's table entry.
+
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 2d00dc6..c39ab4f 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -2724,6 +2724,16 @@ Subtitles
+ 
+     Default: 4 on Android, 0 elsewhere.
+ 
++``--sub-ass-render-threads=<auto|1-64>``
++    How many threads libass renders one subtitle frame with (per-event
++    threaded rendering, from the patched libass every build uses). ``auto``
++    uses every logical core; ``1`` renders on the calling thread alone, for
++    an embedder that wants to rule the threaded path out or keep subtitle
++    rendering off other cores. A change applies to the subtitle track's next
++    reinit.
++
++    Default: auto.
++
+ ``--sub-ass-styles=<filename>``
+     Load all SSA/ASS styles found in the specified file and use them for
+     rendering text subtitles. The syntax of the file is exactly like the ``[V4
+diff --git a/options/options.c b/options/options.c
+index 1790c82..1fbd3e2 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -351,6 +351,9 @@ const struct m_sub_options mp_subtitle_sub_opts = {
+         {"sub-ass-atlas-reuse", OPT_BOOL(sub_ass_atlas_reuse)},
+         {"sub-ass-atlas-pool", OPT_INT(sub_ass_atlas_pool),
+             M_RANGE(0, 8)}, // MP_ASS_PACKER_POOL_MAX
++        // ass_set_threads(): 0 (auto) is every logical core, as 0205 set it.
++        {"sub-ass-render-threads", OPT_CHOICE(sub_ass_render_threads, {"auto", 0}),
++            M_RANGE(1, 64), .flags = UPDATE_SUB_HARD},
+         {0}
+     },
+     .size = sizeof(OPT_BASE_STRUCT),
+diff --git a/options/options.h b/options/options.h
+index 62ddc3d..eb5be63 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -136,6 +136,7 @@ struct mp_subtitle_opts {
+     int sub_bitmap_max_size;
+     bool sub_ass_atlas_reuse;
+     int sub_ass_atlas_pool;
++    int sub_ass_render_threads;
+     char **sub_avopts;
+ };
+ 
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index e16ab9d..f47a0a1 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -298,7 +298,9 @@ static struct ass_render_state *get_renderer(struct sd *sd, int index)
+         talloc_free(r);
+         return NULL;
+     }
+-    unsigned threads = ass_set_threads(r->renderer, 0);
++    // --sub-ass-render-threads: 0 (auto) lets libass use every logical core.
++    unsigned threads = ass_set_threads(r->renderer,
++                                       MPMAX(sd->opts->sub_ass_render_threads, 0));
+     if (threads)
+         MP_VERBOSE(sd, "libass rendering threads: %u\n", threads);
+     else

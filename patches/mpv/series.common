@@ -53,3 +53,6 @@
 # osd_get_sub_schedule() no longer holds osd->lock while its dec_sub queries
 # wait for a render (test test_osd_sub_schedule_lock.sh).
 0304-osd-ask-for-the-subtitle-schedule-without-holding-the-osd-lock.patch
+# --sub-ass-render-threads caps 0205's libass threads (default auto; test
+# test_sub_ass_render_threads.sh).
+0305-sd-ass-render-threads-option.patch
