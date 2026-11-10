@@ -34,14 +34,26 @@ name: Publish binaries
 # row in the record matrix below. The android build lives in android.yml,
 # which ci.yml runs for pull requests too.
 #
-# Only main publishes: a dispatch on any other branch builds, records and
-# verifies everything stale (against the release main would have opened), then
-# opens no release, uploads no asset and pushes no manifest.
+# Only main, and the corruptmods fork's pluet branch, publish: a dispatch on
+# any other branch builds, records and verifies everything stale (against the
+# release main would have opened), then opens no release, uploads no asset and
+# pushes no manifest. The release and the manifest commit belong to the
+# branch the run was dispatched on (github.ref_name), never another, and the
+# asset URLs to the repository running it (keys.py reads GITHUB_REPOSITORY).
 on:
   push:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      groups:
+        description: >-
+          Platform groups to consider, space-separated (e.g. "apple"). Empty,
+          the default and what a push uses, considers every group. A group
+          left out is neither built nor verified, and keeps its committed
+          section of artifacts.json.
+        type: string
+        default: ""
 
 # Two pushes must never interleave asset uploads or commits to main, a
 # cancelled run could leave the manifest committed without its assets, and
@@ -277,6 +289,8 @@ jobs:
 
       - name: Compute stale libraries per group
         id: stale
+        env:
+          REQUESTED_GROUPS: ${{ inputs.groups }}
         # shell: bash adds pipefail, which the default `bash -e` lacks, so a
         # crash in keys.py is not swallowed by the pipe into paste.
         shell: bash
@@ -284,6 +298,23 @@ jobs:
           # The group list and the per-group platform variants are discovered,
           # not restated here: keys.py reads them out of platforms/*/group.json.
           groups="$(python3 scripts/keys.py groups)"
+          # A dispatch may narrow the run to some groups; each must exist.
+          requested="${REQUESTED_GROUPS}"
+          if [ -n "${requested// /}" ]; then
+            for group in ${requested}; do
+              case " ${groups} " in
+                *" ${group} "*) ;;
+                *) echo "unknown platform group: ${group} (one of: ${groups})"; exit 1 ;;
+              esac
+            done
+            for group in ${groups}; do
+              case " ${requested} " in
+                *" ${group} "*) ;;
+                *) echo "${group}: not requested by this dispatch, left as committed" >> "$GITHUB_STEP_SUMMARY" ;;
+              esac
+            done
+            groups="${requested}"
+          fi
           echo "groups=${groups}" >> "$GITHUB_STEP_SUMMARY"
 
           stale_groups=""
@@ -335,13 +366,13 @@ jobs:
       # including an earlier attempt of this same commit. The concurrency group
       # guarantees no other run on main is between its upload and its push.
       - name: Delete releases no manifest points at
-        if: github.ref == 'refs/heads/main'
+        if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/pluet')
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/keys.py prune-releases
 
       - name: Open ${{ needs.plan.outputs.release }}
-        if: github.ref == 'refs/heads/main'
+        if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/pluet')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -495,7 +526,7 @@ jobs:
         run: bash scripts/test_spatial_swiftpm.sh dist/release
 
       - name: Upload this run's binaries to ${{ needs.plan.outputs.release }}
-        if: github.ref == 'refs/heads/main'
+        if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/pluet')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -805,7 +836,7 @@ jobs:
         run: python3 scripts/keys.py verify --platform-group ${{ matrix.group }}
 
       - name: Upload this run's binaries to ${{ needs.plan.outputs.release }}
-        if: steps.stale.outputs.stale == 'true' && github.ref == 'refs/heads/main'
+        if: steps.stale.outputs.stale == 'true' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/pluet')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -911,7 +942,7 @@ jobs:
       # Its release is then one no manifest points at, which the queued run's
       # release job deletes before it rebuilds into a release of its own.
       - name: Push binary manifest
-        if: steps.changes.outputs.changed == 'true' && github.ref == 'refs/heads/main'
+        if: steps.changes.outputs.changed == 'true' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/pluet')
         uses: EndBug/add-and-commit@a94899bca583c204427a224a7af87c02f9b325d5 # v9
         with:
           default_author: github_actions
@@ -924,7 +955,7 @@ jobs:
       # Only once the manifest has landed: a run whose push was rejected leaves
       # an orphan for the next run to delete, and its notes do not matter.
       - name: List the source commit and assets in ${{ needs.plan.outputs.release }}
-        if: steps.changes.outputs.changed == 'true' && github.ref == 'refs/heads/main'
+        if: steps.changes.outputs.changed == 'true' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/pluet')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

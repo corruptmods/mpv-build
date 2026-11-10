@@ -36,6 +36,10 @@ def check(condition, message):
 
 def run(repo, *args, expect=0, env=None):
     environment = dict(os.environ)
+    # The scenarios pin upstream's release URLs. A workflow run names its own
+    # repository in GITHUB_REPOSITORY, which keys.py follows, so leave it out
+    # unless a scenario sets it: the expectations hold wherever this runs.
+    environment.pop("GITHUB_REPOSITORY", None)
     if env:
         environment.update(env)
     result = subprocess.run(
@@ -1651,6 +1655,31 @@ for path in sorted((root / "platforms").glob("*/group.json")):
     data = json.loads(path.read_text(encoding="utf-8"))
     check("scripts/licenses.py" in data["driver"], f"{path.parent.name}: scripts/licenses.py is in its driver")
 print("real group.json: the licence collector keys every group")
+
+# 22. The repository asset URLs belong to: GITHUB_REPOSITORY (owner/name), as a
+#     workflow run sets it, so a fork records and renders its own releases;
+#     upstream when it is unset or malformed.
+def repository_url(value):
+    environment = dict(os.environ)
+    environment.pop("GITHUB_REPOSITORY", None)
+    if value is not None:
+        environment["GITHUB_REPOSITORY"] = value
+    probe = ("import sys; sys.path.insert(0, sys.argv[1]); import keys; "
+             "print(keys.REPOSITORY_URL); print(keys.GROUPS['apple'].asset_base)")
+    out = subprocess.run([sys.executable, "-c", probe, str(root / "scripts")],
+                         env=environment, capture_output=True, text=True, check=True).stdout
+    return out.split()
+
+check(repository_url(None) == ["https://github.com/edde746/mpv-build",
+                               "https://github.com/edde746/mpv-build/releases/download/binaries-apple"],
+      "unset GITHUB_REPOSITORY keeps upstream's URLs")
+check(repository_url("corruptmods/mpv-build") == ["https://github.com/corruptmods/mpv-build",
+                                                  "https://github.com/corruptmods/mpv-build/releases/download/binaries-apple"],
+      "a fork's GITHUB_REPOSITORY gives the fork's URLs")
+for bad in ("", "a/b/c", "owner only", "x/../y/"):
+    check(repository_url(bad)[0] == "https://github.com/edde746/mpv-build",
+          f"a malformed GITHUB_REPOSITORY {bad!r} falls back to upstream")
+print("repository URL: GITHUB_REPOSITORY, else upstream")
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

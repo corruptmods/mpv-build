@@ -224,8 +224,13 @@ PATCHES_ROOT = Path("patches")
 CHECKSUM_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 # Where this repository's GitHub releases serve their assets: every group's
-# legacy `binaries-<group>` base and every per-run release live under it.
-REPOSITORY_URL = "https://github.com/edde746/mpv-build"
+# legacy `binaries-<group>` base and every per-run release live under it. A
+# workflow run names its own repository in GITHUB_REPOSITORY (owner/name), so a
+# fork records and renders its own release URLs; elsewhere it is upstream.
+_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
+if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", _REPOSITORY):
+    _REPOSITORY = "edde746/mpv-build"
+REPOSITORY_URL = f"https://github.com/{_REPOSITORY}"
 DOWNLOAD_BASE = f"{REPOSITORY_URL}/releases/download"
 # A publish run's own release: `binaries-` and the first 12 hex characters of
 # the commit it built. The legacy group releases never match.
