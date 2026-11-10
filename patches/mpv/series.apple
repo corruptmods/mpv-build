@@ -38,3 +38,7 @@
 0300-avfoundation-never-wait-on-the-main-thread-at-teardown.patch
 # --vd-lavc-dv-conversion sets FFmpeg 0300's dv_conversion_mode.
 0301-vd-lavc-dolby-vision-conversion-option.patch
+# The passthrough sink's mid-stream stall watchdog, and its audio session
+# interruption and route-change handling (tests test_ao_avfoundation_stall.sh,
+# test_ao_avfoundation_fallback.sh).
+0302-avfoundation-supervise-the-passthrough-sink-mid-stream.patch

@@ -1,0 +1,513 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: [PATCH] avfoundation: supervise the passthrough sink mid-stream
+
+Once the AVPlayer sink's playhead first moved, only an item failure was
+checked. AVPlayer pauses itself for an audio session interruption or when
+the old route goes away, nothing observed either in passthrough mode, and
+since 0042 anchors the clock to the playhead, a player stopped that way
+froze video with no recovery while the core still had it playing.
+
+- A stall watchdog (the "avp stall watchdog" region): while the core has
+  the sink playing, it has started and at least 1 s of stream is buffered
+  ahead of the playhead, a playhead that does not move for
+  --ao-avfoundation-compressed-stall-timeout seconds (default 4, 0 off) gets
+  one restart (rate 0 then 1, and the session reactivated on iOS/tvOS); still
+  stuck a timeout later, the sink asks for the PCM fallback (0040). A move
+  clears the count; time paused or interrupted does not count, and does not
+  earn a second restart. Pause, resume and stop act on the watchdog
+  themselves (the feed timer is idle while paused, so no check would see
+  the pause), and a resume or start opens a fresh window. While AVPlayer
+  reports waitingToPlayAtSpecifiedRate (rebuffering, evaluating), the
+  allowance is four times longer, so a slow source is not pushed to PCM but
+  a wait that never ends still is.
+- iOS/tvOS: the compressed sink observes AVAudioSession interruption and
+  route-change notifications. The handler queues a block on the AO's serial
+  queue, which reaches the AO through a pointer uninit clears on that queue.
+  An interruption holds the watchdog; its end reactivates the session, and
+  since the system need not report an end, a start or resume clears it too.
+  After
+  either, a player the core has playing that the system left at rate 0 is
+  resumed, and the watchdog gets a fresh window, falling back to PCM if the
+  player still does not move.
+- AVAudioSession calls in init and uninit log their errors at verbose
+  level instead of ignoring them; behaviour on failure is unchanged.
+
+The PCM sink is unchanged. scripts/test_ao_avfoundation_stall.sh runs the
+watchdog on a fake clock (pause modelled as the driver does it, the longer
+allowance while waiting); test_ao_avfoundation_fallback.sh drives it in the
+real driver against a real AVPlayer with no ticks while paused: no restart
+on resume after a pause, an unended interruption cleared by resume, one
+restart, then the fallback, and the option set to 0.
+
+
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index f583a8b..1219de3 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -51,6 +51,98 @@ - (instancetype)initWithAO:(struct ao*)_ao;
+ - (void)invalidate;
+ @end
+ 
++// --- avp stall watchdog
++// Mid-stream supervision of the compressed sink. Once the playhead has moved,
++// the startup supervisor is done and nothing else noticed an AVPlayer that
++// stopped on its own (a system pause, an interruption, a route change): with
++// the clock anchored to the playhead (0042) video then froze with it. While
++// the transport is expected to advance -- the core has it playing, it has
++// started, and there is stream ahead of the playhead -- a playhead that does
++// not move for timeout_ns asks for one restart; still stuck for another
++// timeout_ns, for the PCM fallback. A move clears the count. While AVPlayer
++// itself says it is waiting to play (rebuffering, evaluating), the allowance
++// is AVP_STALL_WAIT_FACTOR times longer, so a slow source is not pushed to
++// PCM, but a wait that never ends still is.
++//
++// The driver calls avp_stall_hold() whenever the transport stops being
++// expected to move without a check seeing it (pause, an interruption) and
++// again when it is expected to move once more (resume), so the window always
++// opens fresh; the feed timer is idle while paused, so no check runs then.
++#define AVP_STALL_WAIT_FACTOR 4
++
++struct avp_stall {
++    int64_t timeout_ns;     // 0: off
++    int64_t last_pos_ns;    // playhead when it last moved
++    int64_t last_move_ns;   // when that was; -1 = no window open
++    int restarts;           // restarts asked for since the playhead last moved
++};
++
++enum avp_stall_action {
++    AVP_STALL_NONE,
++    AVP_STALL_RESTART,
++    AVP_STALL_FALLBACK,
++};
++
++static void avp_stall_reset(struct avp_stall *s)
++{
++    s->last_move_ns = -1;
++    s->restarts = 0;
++}
++
++// Close the window without forgetting a restart already asked for: a pause or
++// an interruption in between does not buy a stuck player a second one.
++static void avp_stall_hold(struct avp_stall *s)
++{
++    s->last_move_ns = -1;
++}
++
++static enum avp_stall_action avp_stall_check(struct avp_stall *s, int64_t now,
++                                             int64_t pos, bool expect_motion,
++                                             bool player_waiting)
++{
++    if (s->timeout_ns <= 0)
++        return AVP_STALL_NONE;
++    if (!expect_motion) {
++        avp_stall_hold(s);
++        return AVP_STALL_NONE;
++    }
++    if (s->last_move_ns < 0) {
++        s->last_pos_ns = pos;
++        s->last_move_ns = now;
++        return AVP_STALL_NONE;
++    }
++    if (pos > s->last_pos_ns) {
++        s->last_pos_ns = pos;
++        s->last_move_ns = now;
++        s->restarts = 0;
++        return AVP_STALL_NONE;
++    }
++    int64_t allowance = s->timeout_ns;
++    if (player_waiting)
++        allowance *= AVP_STALL_WAIT_FACTOR;
++    if (now - s->last_move_ns < allowance)
++        return AVP_STALL_NONE;
++    s->last_move_ns = now; // the next window
++    return s->restarts++ ? AVP_STALL_FALLBACK : AVP_STALL_RESTART;
++}
++// --- end avp stall watchdog
++
++#if TARGET_OS_IPHONE
++// AVAudioSession interruption and route-change notifications for the
++// compressed sink. They are posted on arbitrary threads; the handler only
++// queues a block on the AO's serial queue, and that block reaches the AO
++// through `ao`, which uninit clears on the same queue. So a block queued
++// before uninit runs while the AO is alive, and one queued after finds NULL.
++@interface AVPSessionObserver : NSObject {
++@public
++    struct ao *ao;              // p->queue only
++    dispatch_queue_t queue;     // retained
++}
++- (void)handleInterruption:(NSNotification *)notification;
++- (void)handleRouteChange:(NSNotification *)notification;
++@end
++#endif
++
+ struct priv {
+     // PCM sink
+     AVSampleBufferAudioRenderer *renderer;
+@@ -112,6 +204,15 @@ - (void)invalidate;
+     int avp_last_tcs;            // last logged AVPlayerTimeControlStatus
+     int avp_heartbeat;           // verbose position log divider
+     int64_t avp_lead_ns;         // steady-state ES feed lead (from option)
++    struct avp_stall avp_stall;  // mid-stream watchdog; p->queue only
++    bool avp_interrupted;        // an audio session interruption is ongoing
++#if TARGET_OS_IPHONE
++    AVPSessionObserver *session_observer;
++#endif
++    // Seconds the playhead may stand still mid-stream with stream ahead of
++    // it before the player is restarted, and as long again before the PCM
++    // fallback. 0 disables the watchdog.
++    double opt_compressed_stall_timeout;
+     // Whether this AO accepts compressed AC3/EAC3 and routes it through
+     // AVPlayer. Disable to let the next configured audio output handle the
+     // bitstream instead.
+@@ -176,6 +277,9 @@ - (void)invalidate;
+ #define AVP_START_MIN_NS    MP_TIME_S_TO_NS(1)
+ // Deadline for the playhead to move once the rate is applied.
+ #define AVP_START_GRACE_NS  MP_TIME_S_TO_NS(2)
++// Stream that must be buffered ahead of the playhead for the stall watchdog
++// to expect it to move: less, and the source is starving it, not AVPlayer.
++#define AVP_STALL_MIN_AHEAD_NS MP_TIME_S_TO_NS(1)
+ // History kept behind the loader's read position for offset-0 restarts.
+ #define AVP_ES_HISTORY_BYTES (2 * 1024 * 1024)
+ // Byte budget per second of lead when sizing the ES window: the highest
+@@ -581,6 +685,57 @@ static void avp_update_transport(struct ao *ao)
+     spdif_reload(ao);
+ }
+ 
++#if TARGET_OS_IPHONE
++// Activate the audio session again, logging what refuses.
++static void avp_activate_session(struct ao *ao, const char *why)
++{
++    NSError *err = nil;
++    if (![AVAudioSession.sharedInstance setActive:YES error:&err])
++        MP_VERBOSE(ao, "audio session activation (%s) failed: %s\n", why,
++                   err ? err.localizedDescription.UTF8String : "unknown error");
++}
++#endif
++
++// The mid-stream watchdog (avp_stall_check) applied to the player.
++static void avp_supervise_playback(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    if (p->spdif_reload_requested || !p->item)
++        return;
++    int64_t pos = avp_current_time_ns(ao);
++    bool expect = p->avp_playing && p->avp_rate_applied &&
++                  p->avp_start_deadline < 0 && !p->avp_interrupted &&
++                  p->es_pts - pos >= AVP_STALL_MIN_AHEAD_NS;
++    // AVPlayer says it is waiting for data or deciding whether it has
++    // enough: a longer, still bounded, allowance (AVP_STALL_WAIT_FACTOR).
++    bool waiting = p->player.timeControlStatus ==
++                   AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate;
++    switch (avp_stall_check(&p->avp_stall, mp_time_ns(), pos, expect, waiting)) {
++    case AVP_STALL_NONE:
++        return;
++    case AVP_STALL_RESTART:
++        MP_WARN(ao, "playback stalled at %.3fs with %.3fs buffered (rate %.1f, "
++                "time control %d%s%s); restarting the player\n", pos / 1e9,
++                (p->es_pts - pos) / 1e9, p->player.rate,
++                (int)p->player.timeControlStatus,
++                p->player.reasonForWaitingToPlay ? ", waiting: " : "",
++                p->player.reasonForWaitingToPlay ?
++                    p->player.reasonForWaitingToPlay.UTF8String : "");
++#if TARGET_OS_IPHONE
++        avp_activate_session(ao, "stall restart");
++#endif
++        [p->player setRate:0];
++        [p->player setRate:1];
++        return;
++    case AVP_STALL_FALLBACK:
++        MP_ERR(ao, "playback stalled again at %.3fs; falling back to PCM\n",
++               pos / 1e9);
++        spdif_reload(ao);
++        return;
++    }
++}
++
+ // Main driver for the compressed sink; runs on p->queue (timer tick or a
+ // new loading request).
+ static void feed_avp(struct ao *ao)
+@@ -651,6 +806,7 @@ static void feed_avp(struct ao *ao)
+     avp_anchor_clock(ao);
+     avp_serve_requests(ao);
+     avp_update_transport(ao);
++    avp_supervise_playback(ao);
+ }
+ 
+ // Build a fresh asset/item pair. An elementary stream cannot signal
+@@ -681,6 +837,7 @@ static void avp_create_item(struct ao *ao)
+     p->avp_primed_pts = 0;
+     p->avp_loader_asked = false;
+     p->avp_start_deadline = 0; // armed by avp_update_transport
++    avp_stall_reset(&p->avp_stall);
+     p->avp_last_item_status = -1;
+     p->avp_last_tcs = -1;
+ }
+@@ -887,6 +1044,10 @@ static void start(struct ao *ao)
+     if (p->spdif) {
+         void (^start_block)(void) = ^{
+             p->avp_playing = true;
++            // The core starting the sink ends any interruption the session
++            // never reported the end of; the watchdog starts a fresh window.
++            p->avp_interrupted = false;
++            avp_stall_hold(&p->avp_stall);
+             if (!p->item)
+                 avp_create_item(ao);
+             else if (p->avp_rate_applied)
+@@ -934,6 +1095,7 @@ static void stop(struct ao *ao)
+             p->avp_playing = false;
+             avp_timer_idle(p);
+             avp_teardown_item(ao);
++            avp_stall_reset(&p->avp_stall);
+             return;
+         }
+         [p->renderer stopRequestingMediaData];
+@@ -960,10 +1122,17 @@ static bool set_pause(struct ao *ao, bool paused)
+     if (p->spdif) {
+         void (^pause_block)(void) = ^{
+             p->avp_playing = !paused;
++            // No check runs while paused (the timer is idle), so close the
++            // window here, and open a fresh one on resume: time spent paused
++            // must not count as a stall.
++            avp_stall_hold(&p->avp_stall);
+             if (paused) {
+                 avp_timer_idle(p);
+                 [p->player setRate:0];
+             } else {
++                // A resume ends an interruption the session never reported
++                // the end of.
++                p->avp_interrupted = false;
+                 if (p->avp_rate_applied) {
+                     [p->player setRate:1];
+                     if (p->avp_start_deadline >= 0)
+@@ -1094,6 +1263,74 @@ - (void)handleRestartNotification:(NSNotification*)notification {
+ }
+ @end
+ 
++#if TARGET_OS_IPHONE
++// On p->queue. The session interrupted the compressed sink, or the interruption
++// ended, or the route changed. AVPlayer pauses itself for some of these (an
++// interruption, the old route going away) while the core still has it
++// playing, so the clock anchored to the playhead would hold video. Resume a
++// player the core has playing and give the stall watchdog a fresh window: if
++// it does not move, the watchdog restarts it once and then falls back to PCM.
++static void avp_session_event(struct ao *ao, NSString *name, NSDictionary *info)
++{
++    struct priv *p = ao->priv;
++
++    if (!p->spdif || p->spdif_reload_requested)
++        return;
++    if ([name isEqualToString:AVAudioSessionInterruptionNotification]) {
++        NSUInteger type = [info[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
++        if (type == AVAudioSessionInterruptionTypeBegan) {
++            MP_VERBOSE(ao, "audio session interrupted\n");
++            p->avp_interrupted = true;
++            avp_stall_hold(&p->avp_stall);
++            return;
++        }
++        NSUInteger options = [info[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
++        MP_VERBOSE(ao, "audio session interruption ended%s\n",
++                   options & AVAudioSessionInterruptionOptionShouldResume ?
++                   " (should resume)" : "");
++        p->avp_interrupted = false;
++        avp_activate_session(ao, "interruption end");
++    } else {
++        NSUInteger reason = [info[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
++        AVAudioSessionPortDescription *port =
++            AVAudioSession.sharedInstance.currentRoute.outputs.firstObject;
++        MP_VERBOSE(ao, "audio route changed (reason %lu) to %s, %ld maximum "
++                   "output channels\n", (unsigned long)reason,
++                   port ? port.portType.UTF8String : "none",
++                   (long)AVAudioSession.sharedInstance.maximumOutputNumberOfChannels);
++    }
++    avp_stall_hold(&p->avp_stall);
++    if (p->item && p->avp_playing && p->avp_rate_applied && p->player.rate == 0) {
++        MP_VERBOSE(ao, "resuming the player the session stopped\n");
++        [p->player setRate:1];
++    }
++}
++
++@implementation AVPSessionObserver
++- (void)deliver:(NSNotification *)notification {
++    NSString *name = [notification.name retain];
++    NSDictionary *info = [notification.userInfo retain];
++    dispatch_async(queue, ^{
++        if (self->ao)
++            avp_session_event(self->ao, name, info);
++        [name release];
++        [info release];
++    });
++}
++- (void)handleInterruption:(NSNotification *)notification {
++    [self deliver:notification];
++}
++- (void)handleRouteChange:(NSNotification *)notification {
++    [self deliver:notification];
++}
++- (void)dealloc {
++    if (queue)
++        dispatch_release(queue);
++    [super dealloc];
++}
++@end
++#endif
++
+ @implementation AVPLoader
+ - (instancetype)initWithAO:(struct ao*)_ao {
+     self = [super init];
+@@ -1173,15 +1410,28 @@ static int init(struct ao *ao)
+ 
+ #if TARGET_OS_IPHONE
+     AVAudioSession *instance = AVAudioSession.sharedInstance;
+-    [instance setCategory:AVAudioSessionCategoryPlayback error:nil];
+-    [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
++    NSError *session_err = nil;
++    // Each refusal is logged and ignored, as before: the session may still
++    // play with what the host configured.
++#define AVF_SESSION_LOG(what) \
++    MP_VERBOSE(ao, "audio session: %s failed: %s\n", what, \
++               session_err ? session_err.localizedDescription.UTF8String : "unknown error")
++    if (![instance setCategory:AVAudioSessionCategoryPlayback error:&session_err])
++        AVF_SESSION_LOG("setting the playback category");
++    session_err = nil;
++    if (![instance setMode:AVAudioSessionModeMoviePlayback error:&session_err])
++        AVF_SESSION_LOG("setting the movie playback mode");
+ #if HAVE_MACOS_12_FEATURES
+     if (@available(tvOS 15.0, iOS 15.0, *)) {
+-        if (spdif || ao->channels.num > 2)
+-            [instance setSupportsMultichannelContent:YES error:nil];
++        session_err = nil;
++        if ((spdif || ao->channels.num > 2) &&
++            ![instance setSupportsMultichannelContent:YES error:&session_err])
++            AVF_SESSION_LOG("enabling multichannel content");
+     }
+ #endif
+-    [instance setActive:YES error:nil];
++    session_err = nil;
++    if (![instance setActive:YES error:&session_err])
++        AVF_SESSION_LOG("activation");
+     NSInteger maxChannels = instance.maximumOutputNumberOfChannels;
+     if (spdif) {
+         AVAudioSessionPortDescription *port = instance.currentRoute.outputs.firstObject;
+@@ -1189,8 +1439,11 @@ static int init(struct ao *ao)
+                 port ? port.portType.UTF8String : "none", (long)maxChannels);
+     } else {
+         NSInteger prefChannels = MIN(maxChannels, ao->channels.num);
+-        [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
++        session_err = nil;
++        if (![instance setPreferredOutputNumberOfChannels:prefChannels error:&session_err])
++            AVF_SESSION_LOG("setting the preferred output channels");
+     }
++#undef AVF_SESSION_LOG
+ #endif
+ 
+     if ((p->queue = dispatch_queue_create(
+@@ -1261,6 +1514,21 @@ static int init(struct ao *ao)
+         dispatch_resume(p->avp_timer);
+ 
+         p->avp_lead_ns = (int64_t)(p->opt_compressed_lead * 1e9);
++        p->avp_stall.timeout_ns = (int64_t)(p->opt_compressed_stall_timeout * 1e9);
++        avp_stall_reset(&p->avp_stall);
++#if TARGET_OS_IPHONE
++        p->session_observer = [[AVPSessionObserver alloc] init];
++        p->session_observer->ao = ao;
++        p->session_observer->queue = p->queue;
++        dispatch_retain(p->queue);
++        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++        [nc addObserver:p->session_observer selector:@selector(handleInterruption:)
++                   name:AVAudioSessionInterruptionNotification
++                 object:AVAudioSession.sharedInstance];
++        [nc addObserver:p->session_observer selector:@selector(handleRouteChange:)
++                   name:AVAudioSessionRouteChangeNotification
++                 object:AVAudioSession.sharedInstance];
++#endif
+ 
+         // 100ms of IEC data per pull plus room for carried-over bursts
+         p->stash_size = (ao->samplerate / 10) * af_fmt_to_bytes(ao->format) *
+@@ -1392,6 +1660,13 @@ static int init(struct ao *ao)
+         [p->loader invalidate];
+         [p->loader release];
+     }
++#if TARGET_OS_IPHONE
++    if (p->session_observer) {
++        [[NSNotificationCenter defaultCenter] removeObserver:p->session_observer];
++        p->session_observer->ao = NULL;
++        [p->session_observer release];
++    }
++#endif
+     if (p->player) [p->player release];
+     if (p->renderer) [p->renderer release];
+     if (p->synchronizer) [p->synchronizer release];
+@@ -1399,10 +1674,14 @@ static int init(struct ao *ao)
+     if (p->format_description) CFRelease(p->format_description);
+ 
+ #if TARGET_OS_IPHONE
+-    [AVAudioSession.sharedInstance setActive:NO
+-        withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+-        error:nil
+-    ];
++    {
++        NSError *err = nil;
++        if (![AVAudioSession.sharedInstance setActive:NO
++                withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
++                error:&err])
++            MP_VERBOSE(ao, "audio session deactivation failed: %s\n",
++                       err ? err.localizedDescription.UTF8String : "unknown error");
++    }
+ #endif
+ 
+     return CONTROL_ERROR;
+@@ -1421,7 +1700,16 @@ static void uninit(struct ao *ao)
+         dispatch_sync(p->queue, ^{
+             dispatch_source_cancel(p->avp_timer);
+             [p->loader invalidate];
++#if TARGET_OS_IPHONE
++            // Blocks the session observer queues from now on find no AO.
++            p->session_observer->ao = NULL;
++#endif
+         });
++#if TARGET_OS_IPHONE
++        [[NSNotificationCenter defaultCenter] removeObserver:p->session_observer];
++        [p->session_observer release];
++        p->session_observer = nil;
++#endif
+         dispatch_release(p->avp_timer);
+         [p->loader release];
+         [p->player release];
+@@ -1450,10 +1738,14 @@ static void uninit(struct ao *ao)
+     }
+ 
+ #if TARGET_OS_IPHONE
+-    [AVAudioSession.sharedInstance setActive:NO
+-        withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+-        error:nil
+-    ];
++    {
++        NSError *err = nil;
++        if (![AVAudioSession.sharedInstance setActive:NO
++                withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
++                error:&err])
++            MP_VERBOSE(ao, "audio session deactivation failed: %s\n",
++                       err ? err.localizedDescription.UTF8String : "unknown error");
++    }
+ #endif
+ }
+ 
+@@ -1473,6 +1765,7 @@ static void uninit(struct ao *ao)
+     .priv_defaults  = &(const struct priv){
+         .opt_accept_compressed = true,
+         .opt_compressed_lead = 8,
++        .opt_compressed_stall_timeout = 4,
+         // Well inside the renderer's own depth, so the queue still absorbs
+         // scheduling jitter, while cutting the delay before a volume change
+         // is audible to a fraction of what it was.
+@@ -1486,6 +1779,8 @@ static void uninit(struct ao *ao)
+ #endif
+         {"accept-compressed", OPT_BOOL(opt_accept_compressed)},
+         {"compressed-lead", OPT_DOUBLE(opt_compressed_lead), M_RANGE(1, 30)},
++        {"compressed-stall-timeout", OPT_DOUBLE(opt_compressed_stall_timeout),
++         M_RANGE(0, 60)},
+         {0}
+     },
+     .options_prefix = "ao-avfoundation",

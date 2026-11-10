@@ -3,7 +3,9 @@
 // (patches/mpv/pool/0040-ao-decode-the-playing-track-to-pcm-when-passthrough-fails.patch,
 // patches/mpv/pool/0041-avfoundation-say-when-avplayer-never-asked-for-the-stream.patch),
 // and of the clock anchor it keeps while the playhead is parked
-// (patches/mpv/pool/0042-avfoundation-anchor-the-passthrough-clock-to-the-playhead.patch).
+// (patches/mpv/pool/0042-avfoundation-anchor-the-passthrough-clock-to-the-playhead.patch),
+// and of the mid-stream stall watchdog
+// (patches/mpv/pool/0302-avfoundation-supervise-the-passthrough-sink-mid-stream.patch).
 // It drives the driver the way mpv does, against a real AVPlayer, in a process
 // whose main thread never services the main dispatch queue. AVPlayer attaches
 // an item there, so it never asks the resource loader for the stream and the
@@ -357,6 +359,92 @@ static void *run(void *unused)
             free_ao(ac3);
         }
         CHECK(fallbacks == 2 && reloads == 0, "opening outputs requests nothing");
+
+        // 0302: the mid-stream stall watchdog. AVPlayer never plays here, so
+        // a sink whose startup supervisor is marked done stands in for one
+        // whose playhead moved and then stopped, with its stream ahead.
+        int64_t t2 = t1 + 20 * GRACE;
+        set_clock(t2);
+        struct ao *stall = open_ao(AF_FORMAT_S_EAC3);
+        CHECK(stall, "an E-AC-3 output opens for the stall watchdog");
+        if (stall) {
+            struct priv *q = stall->priv;
+            const int64_t timeout = q->avp_stall.timeout_ns;
+            CHECK(timeout == MP_TIME_S_TO_NS(4), "the watchdog defaults to 4 s (%.3f)", timeout / 1e9);
+            audio_out_avfoundation.start(stall);
+            prime(stall);
+            dispatch_sync(q->queue, ^{ q->avp_start_deadline = -1; });
+            int warned = logged(MSGL_WARN, "playback stalled");
+            s = tick(stall); // opens the window
+
+            // Still for most of a window, then a pause: the feed timer is
+            // idle while paused, so no tick runs until the resume, and the
+            // resume must not restart at once (the paused time is not a
+            // stall), nor may an interruption the session never ended keep
+            // the watchdog off.
+            set_clock(t2 + timeout - MP_TIME_MS_TO_NS(100));
+            tick(stall);
+            audio_out_avfoundation.set_pause(stall, true);
+            set_clock(t2 + 50 * timeout);
+            audio_out_avfoundation.set_pause(stall, false); // feeds once
+            CHECK(logged(MSGL_WARN, "playback stalled") == warned,
+                  "resuming after a pause restarted the player at once");
+            // An interruption whose end the session never reported.
+            audio_out_avfoundation.set_pause(stall, true);
+            dispatch_sync(q->queue, ^{ q->avp_interrupted = true; });
+            audio_out_avfoundation.set_pause(stall, false);
+            s = on_queue(stall, false);
+            CHECK(!s.avp_interrupted, "resuming left an unended interruption holding the watchdog");
+            t2 += 50 * timeout; // the window opened at the resume
+            set_clock(t2 + timeout - 1);
+            tick(stall);
+            CHECK(logged(MSGL_WARN, "playback stalled") == warned, "nothing before the timeout");
+            set_clock(t2 + timeout);
+            s = tick(stall);
+            CHECK(logged(MSGL_WARN, "playback stalled") == warned + 1 && fallbacks == 2,
+                  "a stalled playhead with stream ahead restarts the player once");
+            CHECK(s.avp_stall.restarts == 1 && !s.spdif_reload_requested, "and does not fall back yet");
+
+            // A pause in between, with no ticks while paused as with the
+            // idle timer: its length does not count, and it does not buy a
+            // second restart.
+            audio_out_avfoundation.set_pause(stall, true);
+            set_clock(t2 + 10 * timeout);
+            audio_out_avfoundation.set_pause(stall, false); // feeds: a new window
+            set_clock(t2 + 11 * timeout - 1);
+            tick(stall);
+            CHECK(fallbacks == 2, "the paused time does not count");
+            set_clock(t2 + 11 * timeout);
+            s = tick(stall);
+            CHECK(logged(MSGL_ERR, "playback stalled again") == 1 && fallbacks == 3 && reloads == 0,
+                  "still stalled a timeout after resuming: the PCM fallback (%d)", fallbacks);
+            CHECK(s.spdif_reload_requested && q->player.rate == 0, "and the player stops");
+            set_clock(t2 + 20 * timeout);
+            tick(stall);
+            CHECK(fallbacks == 3, "once");
+            audio_out_avfoundation.uninit(stall);
+            free_ao(stall);
+        }
+
+        // With the watchdog off, a stalled player is left alone, as before.
+        set_clock(t2 + 30 * GRACE);
+        struct ao *off = open_ao(AF_FORMAT_S_EAC3);
+        if (off) {
+            struct priv *q = off->priv;
+            q->avp_stall.timeout_ns = 0;
+            audio_out_avfoundation.start(off);
+            prime(off);
+            dispatch_sync(q->queue, ^{ q->avp_start_deadline = -1; });
+            int warned = logged(MSGL_WARN, "playback stalled");
+            for (int n = 0; n < 5; n++) {
+                set_clock(t2 + 30 * GRACE + n * MP_TIME_S_TO_NS(60));
+                tick(off);
+            }
+            CHECK(logged(MSGL_WARN, "playback stalled") == warned && fallbacks == 3,
+                  "--ao-avfoundation-compressed-stall-timeout=0 disables it");
+            audio_out_avfoundation.uninit(off);
+            free_ao(off);
+        }
         CHECK(logged(MSGL_FATAL, NULL) == 0, "no output was refused");
     }
     return NULL;

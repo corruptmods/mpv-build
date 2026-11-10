@@ -67,6 +67,20 @@ that track to PCM and seeks back to the playback position. The fallback
 belongs to the track: the next track or file, or a later output reload, tries
 passthrough again. Patches 0040-0042 carry the details.
 
+Mid-stream, the sink watches its own playhead (patch 0302). While the core
+has it playing and at least a second of stream is buffered, a playhead that
+stands still for `--ao-avfoundation-compressed-stall-timeout` seconds
+(default 4, 0 turns it off) gets one restart of the player, and the PCM
+fallback if it is still stuck a timeout later. On iOS and tvOS the sink also
+follows the audio session: an interruption holds the watchdog, and after the
+interruption ends or the route changes, a player the system left stopped is
+resumed and watched again. AVAudioSession errors are logged at verbose level.
+Pausing, resuming and stopping reset the watchdog's window, and a start or
+resume also ends an interruption the system never reported the end of. While
+AVPlayer reports that it is waiting to play (rebuffering), the allowance is
+four times the timeout, so a slow source is not pushed to PCM, but a wait
+that never ends still falls back.
+
 ## Dolby Vision profile 7
 
 VideoToolbox takes profile 8.1, so FFmpeg converts a profile 7 stream's RPUs
