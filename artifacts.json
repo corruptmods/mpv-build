@@ -64,138 +64,138 @@
         "FFmpeg": {
           "frameworks": {
             "Libavcodec": {
-              "asset": "Libavcodec-67ea4405d4c9.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8",
-              "checksum": "81c107bd15e2a86b3cdd02d12b94071cb1261be47305a2233b6b896a42029a6e"
+              "asset": "Libavcodec-864477ccfe18.xcframework.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7",
+              "checksum": "deda7aade329237aa77a126b09fe00425d89f447517e438fdd9a9721c55db07c"
             },
             "Libavdevice": {
-              "asset": "Libavdevice-67ea4405d4c9.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8",
-              "checksum": "af5b42c83b91822690fd3f5cf234235784364f7e0a99d3a81f0243e2eb0966c0"
+              "asset": "Libavdevice-864477ccfe18.xcframework.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7",
+              "checksum": "ecb4600583970eac6c8c47cc5a3d510b5739317e47004a8c0fbffe6ed3239690"
             },
             "Libavfilter": {
-              "asset": "Libavfilter-67ea4405d4c9.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8",
-              "checksum": "f513e69d6721e060ec9ef37420866f219f03a8d087ffb3b0f57b504186a13b85"
+              "asset": "Libavfilter-864477ccfe18.xcframework.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7",
+              "checksum": "6b16bb8a0495abd4144e4683316278e988f5e59c20f2368bb963ce382037450d"
             },
             "Libavformat": {
-              "asset": "Libavformat-67ea4405d4c9.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8",
-              "checksum": "71c21953fada4ed4f5c9c429e413fe1b8ea8f7c67951b7e148a7995b6eeee3ad"
+              "asset": "Libavformat-864477ccfe18.xcframework.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7",
+              "checksum": "ad7508e66fda39f3c0424140353c2f77c19a52013271ffac8336296f02f3389d"
             },
             "Libavutil": {
-              "asset": "Libavutil-67ea4405d4c9.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8",
-              "checksum": "db3f2beef331f10eda399bc5dc48c45183e8441085069548e2d4d808a5bc1ab1"
+              "asset": "Libavutil-864477ccfe18.xcframework.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7",
+              "checksum": "f2ea2c8d6c4822966f359d3b2d5ef1b23b2c5d18f9ade9f6316d52a0727b6066"
             },
             "Libswresample": {
-              "asset": "Libswresample-67ea4405d4c9.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8",
-              "checksum": "4092981fe0365988a5db177c1663988887be95e72d2b04d9ccb038b6ff21adb3"
+              "asset": "Libswresample-864477ccfe18.xcframework.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7",
+              "checksum": "32f407fe4f300bf455d34fe9899a9e3106ad3e9bed9dd38acbd08a77c7cb6436"
             },
             "Libswscale": {
-              "asset": "Libswscale-67ea4405d4c9.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8",
-              "checksum": "e5b9fb6bc219b14726e966d7f311fe50e79d11f83b1d72c2725b11b06b599c31"
+              "asset": "Libswscale-864477ccfe18.xcframework.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7",
+              "checksum": "783cf35054de2c12c7404986799e93b7edd52a7b9d4bc9b44ccf959554a8750a"
             }
           },
-          "key": "67ea4405d4c9",
+          "key": "864477ccfe18",
           "prebuilt": {
             "ios": {
-              "asset": "FFmpeg-all-67ea4405d4c9-ios.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "FFmpeg-all-864477ccfe18-ios.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "isimulator": {
-              "asset": "FFmpeg-all-67ea4405d4c9-isimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "FFmpeg-all-864477ccfe18-isimulator.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "maccatalyst": {
-              "asset": "FFmpeg-all-67ea4405d4c9-maccatalyst.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "FFmpeg-all-864477ccfe18-maccatalyst.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "macos": {
-              "asset": "FFmpeg-all-67ea4405d4c9-macos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "FFmpeg-all-864477ccfe18-macos.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "tvos": {
-              "asset": "FFmpeg-all-67ea4405d4c9-tvos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "FFmpeg-all-864477ccfe18-tvos.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "tvsimulator": {
-              "asset": "FFmpeg-all-67ea4405d4c9-tvsimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "FFmpeg-all-864477ccfe18-tvsimulator.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             }
           }
         },
         "libass": {
           "frameworks": {
             "Libass": {
-              "asset": "Libass-896230064e27.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8",
-              "checksum": "26bbe8502b4cc0d786ceed5c5a5ece1a2ad2f8c1560f3017f405b5b00a593b38"
+              "asset": "Libass-7c7c7b217282.xcframework.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7",
+              "checksum": "71a03a142d2ce23409273fbd9f577e49bfb6b5706f6ad8fa5a27ce4531a3363c"
             }
           },
-          "key": "896230064e27",
+          "key": "7c7c7b217282",
           "prebuilt": {
             "ios": {
-              "asset": "libass-all-896230064e27-ios.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libass-all-7c7c7b217282-ios.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "isimulator": {
-              "asset": "libass-all-896230064e27-isimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libass-all-7c7c7b217282-isimulator.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "maccatalyst": {
-              "asset": "libass-all-896230064e27-maccatalyst.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libass-all-7c7c7b217282-maccatalyst.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "macos": {
-              "asset": "libass-all-896230064e27-macos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libass-all-7c7c7b217282-macos.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "tvos": {
-              "asset": "libass-all-896230064e27-tvos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libass-all-7c7c7b217282-tvos.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "tvsimulator": {
-              "asset": "libass-all-896230064e27-tvsimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libass-all-7c7c7b217282-tvsimulator.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             }
           }
         },
         "libmpv": {
           "frameworks": {
             "Libmpv": {
-              "asset": "Libmpv-27e716d6a4f4.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8",
-              "checksum": "c35b03e2b7e207fec61d77cab8f22d49c76d65b31ad8f1b8b4b63c61e1c67bac"
+              "asset": "Libmpv-b9105d332ff0.xcframework.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7",
+              "checksum": "00841697cffce3df6d3c569da9518c9171c1fae1a401c8b078caf93a35e70d05"
             }
           },
-          "key": "27e716d6a4f4",
+          "key": "b9105d332ff0",
           "prebuilt": {
             "ios": {
-              "asset": "libmpv-all-27e716d6a4f4-ios.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libmpv-all-b9105d332ff0-ios.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "isimulator": {
-              "asset": "libmpv-all-27e716d6a4f4-isimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libmpv-all-b9105d332ff0-isimulator.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "maccatalyst": {
-              "asset": "libmpv-all-27e716d6a4f4-maccatalyst.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libmpv-all-b9105d332ff0-maccatalyst.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "macos": {
-              "asset": "libmpv-all-27e716d6a4f4-macos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libmpv-all-b9105d332ff0-macos.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "tvos": {
-              "asset": "libmpv-all-27e716d6a4f4-tvos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libmpv-all-b9105d332ff0-tvos.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             },
             "tvsimulator": {
-              "asset": "libmpv-all-27e716d6a4f4-tvsimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-42bac6793cc8"
+              "asset": "libmpv-all-b9105d332ff0-tvsimulator.zip",
+              "assetBase": "https://github.com/corruptmods/mpv-build/releases/download/binaries-2d8324af5ad7"
             }
           }
         }
