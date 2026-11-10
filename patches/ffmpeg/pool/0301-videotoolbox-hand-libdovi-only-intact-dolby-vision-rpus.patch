@@ -1,0 +1,211 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: [PATCH] videotoolbox: hand libdovi only intact Dolby Vision RPUs
+
+The apple group links a prebuilt libdovi 3.3.2, whose C API aborts the
+process when its parser panics. 0021 refuses the one malformed shape known
+to panic (dovi_rpu_long_enough); everything else reaches the parser, and
+libdovi checks an RPU's CRC32 only after parsing all of it, so a damaged
+RPU is parsed in full before it is rejected.
+
+ff_dovi_p7_rpu_check() requires, before the call, what libdovi requires
+anyway: 25 bytes to 64 KiB, the 7C 01 19 08 09 NAL header and RPU prefix,
+a payload, the CRC32 and the 0x80 final byte after emulation prevention
+bytes are dropped and trailing zeros trimmed, and a CRC32 (MPEG-2) that
+matches the stored one. Nothing libdovi accepts is refused; a damaged or
+truncated RPU now never reaches its parser. The 64 KiB cap is a sanity
+bound, not a spec one: real RPUs are a few hundred bytes.
+
+VideoToolbox calls it before converting a profile 7 RPU. A refused RPU is
+dropped like one libdovi rejects (the frame decodes through its base
+layer), logged as a warning once per decoder and at verbose level after
+that, and libdovi is not called. The conversion itself and the Android
+MediaCodec path are unchanged.
+
+What this cannot do: a crafted RPU with a correct CRC32 still reaches
+libdovi's parser, so a panic in it still aborts. libdovi 3.4.0 (dovi_tool
+d1abe0e27ff2c7ab3339614d06db9f8a058af6b2) adds the trimmed-length check
+that 0021 works around but still parses before checking the CRC32.
+
+scripts/test_dovi_rpu_check.sh takes the check verbatim and runs it over
+libdovi's own test RPUs at the commit versions.json pins: all are taken,
+and bit-flipped, truncated and zero-padded ones are refused.
+
+
+diff --git a/libavcodec/dovi_convert.c b/libavcodec/dovi_convert.c
+index 33e2744..0c14693 100644
+--- a/libavcodec/dovi_convert.c
++++ b/libavcodec/dovi_convert.c
+@@ -23,6 +23,7 @@
+ 
+ #include <stddef.h>
+ #include <stdint.h>
++#include <string.h>
+ 
+ #include "libavutil/error.h"
+ #include "libavutil/log.h"
+@@ -30,6 +31,102 @@
+ 
+ #include "dovi_convert.h"
+ 
++// --- dovi p7 rpu check
++/*
++ * What libdovi will accept, checked before it sees the NAL, for the callers
++ * that must not reach its parser with data it can panic on (a panic aborts
++ * the process through its C API). libdovi 3.3.2 checks the RPU's CRC32 only
++ * after it has parsed the whole payload, so corrupt data reaches its parser.
++ * Requiring here what it requires anyway, a CRC32 that matches, means only
++ * an RPU exactly as its encoder wrote it is parsed: a damaged stream is
++ * refused without calling in. Nothing valid is refused, since libdovi
++ * rejects every one of these shapes itself.
++ *
++ * It cannot stop a crafted RPU with a correct CRC32 from reaching a panic in
++ * the parser; only a libdovi without one can.
++ *
++ * Bounds, all libdovi's own: at least 25 bytes; the NAL header and RPU
++ * prefix 7C 01 19 08 09 (rpu_type 2); after its emulation prevention bytes
++ * are dropped and trailing zero bytes trimmed, the prefix byte, a payload
++ * byte, the CRC32 and the 0x80 final byte; the CRC32 (MPEG-2: polynomial
++ * 0x04C11DB7, initial value all ones, unreflected) over everything between
++ * the prefix byte and the CRC32 equals the stored one. On top, a NAL larger
++ * than DOVI_RPU_MAX_NAL_SIZE is refused: real RPUs are a few hundred bytes,
++ * and the bound caps the work and libdovi's allocations per frame.
++ */
++#define DOVI_RPU_MAX_NAL_SIZE (64 * 1024)
++
++static uint32_t dovi_rpu_crc32_update(uint32_t crc, uint8_t byte)
++{
++    crc ^= (uint32_t)byte << 24;
++    for (int i = 0; i < 8; i++)
++        crc = crc & 0x80000000 ? (crc << 1) ^ 0x04C11DB7 : crc << 1;
++    return crc;
++}
++
++int ff_dovi_p7_rpu_check(const uint8_t *nal, size_t size, const char **why)
++{
++    static const uint8_t start[] = { 0x7C, 0x01, 0x19, 0x08, 0x09 };
++    const uint8_t *rpu = nal + 2;
++    size_t len, kept = 0, end = 0;
++    uint32_t crc = 0xFFFFFFFF, stored = 0;
++    uint8_t last = 0;
++
++    *why = NULL;
++    if (size < 25) {
++        *why = "shorter than 25 bytes";
++        return AVERROR_INVALIDDATA;
++    }
++    if (size > DOVI_RPU_MAX_NAL_SIZE) {
++        *why = "larger than 64 KiB";
++        return AVERROR_INVALIDDATA;
++    }
++    if (memcmp(nal, start, sizeof(start))) {
++        *why = "unexpected NAL header or RPU prefix";
++        return AVERROR_INVALIDDATA;
++    }
++
++    // Pass 1: the unescaped length up to the last nonzero byte. libdovi
++    // drops every 3 that follows two zero bytes of the input.
++    len = size - 2;
++    for (size_t i = 0; i < len; i++) {
++        if (i >= 2 && !rpu[i - 2] && !rpu[i - 1] && rpu[i] == 3)
++            continue;
++        kept++;
++        if (rpu[i])
++            end = kept;
++    }
++    if (end < 7) {
++        *why = "RPU data too short";
++        return AVERROR_INVALIDDATA;
++    }
++
++    // Pass 2: CRC32 over unescaped bytes [1, end - 5), the stored CRC32 in
++    // [end - 5, end - 1), the final byte at end - 1.
++    kept = 0;
++    for (size_t i = 0; i < len && kept < end; i++) {
++        if (i >= 2 && !rpu[i - 2] && !rpu[i - 1] && rpu[i] == 3)
++            continue;
++        if (kept >= 1 && kept < end - 5)
++            crc = dovi_rpu_crc32_update(crc, rpu[i]);
++        else if (kept >= end - 5 && kept < end - 1)
++            stored = stored << 8 | rpu[i];
++        else if (kept == end - 1)
++            last = rpu[i];
++        kept++;
++    }
++    if (last != 0x80) {
++        *why = "no 0x80 final byte";
++        return AVERROR_INVALIDDATA;
++    }
++    if (crc != stored) {
++        *why = "CRC32 mismatch";
++        return AVERROR_INVALIDDATA;
++    }
++    return 0;
++}
++// --- end dovi p7 rpu check
++
+ // --- dovi p7 conversion core
+ 
+ #if CONFIG_LIBDOVI
+diff --git a/libavcodec/dovi_convert.h b/libavcodec/dovi_convert.h
+index 3517718..0b22e48 100644
+--- a/libavcodec/dovi_convert.h
++++ b/libavcodec/dovi_convert.h
+@@ -44,4 +44,14 @@
+ int ff_dovi_convert_p7_rpu_to_p81(const uint8_t *nal, size_t size,
+                                   uint8_t **out, size_t *out_size, void *logctx);
+ 
++/**
++ * Check a Dolby Vision RPU NAL against what libdovi requires before it is
++ * handed to ff_dovi_convert_p7_rpu_to_p81(): size bounds, the NAL header and
++ * RPU prefix, the final byte and the RPU's own CRC32. Nothing is logged.
++ *
++ * @param why  set to a static description of the failure, or NULL
++ * @return 0 if libdovi may be called, AVERROR_INVALIDDATA otherwise
++ */
++int ff_dovi_p7_rpu_check(const uint8_t *nal, size_t size, const char **why);
++
+ #endif /* AVCODEC_DOVI_CONVERT_H */
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index a0411be..ae43a98 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -1591,10 +1591,23 @@ static int videotoolbox_hevc_decode_dovi_p81_rpu(AVCodecContext *avctx,
+                                                  const uint8_t *buffer,
+                                                  uint32_t size)
+ {
++    VTContext *vtctx = avctx->internal->hwaccel_priv_data;
+     uint8_t *p81 = NULL;
+     size_t p81_size = 0;
++    const char *why;
+     int ret;
+ 
++    // libdovi aborts the process on some malformed RPUs: only an intact one
++    // reaches it. A refused RPU is dropped like one libdovi rejects, and
++    // the frame decodes through its base layer.
++    if (ff_dovi_p7_rpu_check(buffer, size, &why) < 0) {
++        av_log(avctx, vtctx->dovi_rpus_refused++ ? AV_LOG_VERBOSE : AV_LOG_WARNING,
++               "Dolby Vision RPU not converted (%s); dropping it, the frame "
++               "decodes through its base layer%s\n", why,
++               vtctx->dovi_rpus_refused > 1 ? "" : " (further ones at verbose level)");
++        return 0;
++    }
++
+     ret = ff_dovi_convert_p7_rpu_to_p81(buffer, size, &p81, &p81_size, avctx);
+     if (ret >= 0)
+         ret = videotoolbox_common_decode_slice(avctx, p81, p81_size);
+diff --git a/libavcodec/vt_internal.h b/libavcodec/vt_internal.h
+index 5181aff..f62f750 100644
+--- a/libavcodec/vt_internal.h
++++ b/libavcodec/vt_internal.h
+@@ -52,6 +52,10 @@ typedef struct VTContext {
+     // the HEVC decoder's dv_conversion_mode or, unset, the environment;
+     // resolved once in ff_videotoolbox_common_init().
+     int dovi_mode;
++
++    // Profile 7 RPUs refused before libdovi saw them; the first is logged
++    // as a warning, the rest at verbose level.
++    unsigned dovi_rpus_refused;
+ } VTContext;
+ 
+ int ff_videotoolbox_alloc_frame(AVCodecContext *avctx, AVFrame *frame);

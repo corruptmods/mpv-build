@@ -79,6 +79,12 @@ sets it on the decoders that have it, and
 `PLUET_DV_CONVERSION_MODE`, else `PLEZY_DV_CONVERSION_MODE`, once when the
 hardware decoder opens (FFmpeg patch 0300, mpv patch 0301).
 
+The apple libdovi prebuilt (3.3.2) aborts the process if its parser panics,
+so VideoToolbox converts only RPUs whose size, prefix, final byte and CRC32
+libdovi would accept; any other RPU is dropped (the frame decodes through its
+base layer), logged once (FFmpeg patch 0301). That keeps damaged streams away
+from the parser. It cannot stop a crafted RPU with a correct CRC32.
+
 ## Spatial audio (`ao=spatial`)
 
 `ao_spatial` (patch 0039) plays TrueHD Atmos and DTS:X by handing mpv's IEC

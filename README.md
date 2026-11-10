@@ -253,6 +253,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_player_release_held_frame.sh` | ending a file frees the decoder before the next opens (patch 0139) | PR, main |
 | `test_player_video_restart.sh` | restored video syncs to already-running audio (patch 0210) | PR |
 | `test_spdif_truehd_branch.sh` | TrueHD units keep their IEC 61937 carrier offsets across seamless-branch timing jumps (patch 0039) | PR, main |
+| `test_dovi_rpu_check.sh` | VideoToolbox hands libdovi only RPUs whose size, prefix, final byte and CRC32 it would accept; libdovi's own test RPUs pass, damaged ones do not (FFmpeg patch 0301) | PR |
 | `test_vt_dovi_conversion_mode.sh` | VideoToolbox's Dolby Vision profile 7 mode: the HEVC decoder's `dv_conversion_mode` AVOption, else the environment, read once (FFmpeg patch 0300) | PR |
 | `test_tcp_family_lookup.sh` | per-family hostname lookup and connection race (patch 0029) | PR, main |
 | `test_android_glue.sh` | the mpv-android JNI glue; see [docs/android.md](docs/android.md#tests) | PR, main |

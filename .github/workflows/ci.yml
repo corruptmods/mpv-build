@@ -121,6 +121,9 @@ jobs:
               if component == 'ffmpeg' and group == 'apple':
                 # VideoToolbox's Dolby Vision profile 7 mode: plain C, stub types.
                 subprocess.run(['bash', 'scripts/test_vt_dovi_conversion_mode.sh', str(dest)], check=True)
+                # The RPU check before libdovi, over libdovi's own test RPUs
+                # (clones the dovi_tool commit versions.json pins).
+                subprocess.run(['bash', 'scripts/test_dovi_rpu_check.sh', str(dest)], check=True)
               if component == 'mpv' and group == 'android':
                 subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_audiotrack_truehd.sh', str(dest)], check=True)
