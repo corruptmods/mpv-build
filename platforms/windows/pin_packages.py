@@ -51,7 +51,10 @@ EXTRA_COMPONENTS and upstream_patch_step()).
 This script is also the one place that resolves the windows pin: `--print-pins`
 emits the pinned-source inventory build.sh invalidates against, and
 `--print-winbuild-pin` the meta-build checkout's url and commit, which is the
-build-state cache key.
+build-state cache key. It is also the one place that knows winbuild's
+package graph: `--print-licence-sources <build dir>` emits the source tree of
+every component libmpv-2.dll links, which package.sh hands to
+scripts/licenses.py (see linked_packages()).
 
 The script also suppresses the check-git step in cmake/custom_steps.cmake.
 Upstream injects it at configure time whenever a package's source dir already
@@ -66,9 +69,14 @@ at CHECK_GIT_ORIGINAL).
 """
 
 import argparse
+import hashlib
 import json
+import os
+import re
 import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 COMPONENTS = ("mpv", "ffmpeg", "libass")
@@ -96,6 +104,11 @@ COMPONENTS = ("mpv", "ffmpeg", "libass")
 #     since 6c3b4f36 calls its own renamed MD5 while md5.c is still compiled
 #     out under that define, so the ffmpeg link fails on undefined
 #     aribcc_md5_* symbols. Pinned to the release before the rename.
+#   fontconfig: winbuild builds the main tip and git-ams its own
+#     fontconfig-0001/0002 patches onto it; upstream dff5c35 (2026-10-30)
+#     changed src/fcdir.c and they no longer apply, so every cold build
+#     failed. Pinned to be20036a, the newest main commit both apply to. Drop
+#     the pin once winbuild rebases its fontconfig patches.
 EXTRA_COMPONENTS = {
     "mingw-w64": "toolchain/mingw-w64.cmake",
     "llvm": "toolchain/llvm/llvm.cmake",
@@ -103,6 +116,7 @@ EXTRA_COMPONENTS = {
     "nv-codec-headers": "packages/nvcodec-headers.cmake",
     "openssl": "packages/openssl.cmake",
     "libaribcaption": "packages/libaribcaption.cmake",
+    "fontconfig": "packages/fontconfig.cmake",
 }
 GROUP = "windows"
 # The meta-build checkout build.sh fetches: its commit pins the whole
@@ -462,6 +476,215 @@ def pin_davs2_build_time(text):
     return text.replace(DAVS2_CONFIGURE_END, end, 1)
 
 
+# What libmpv-2.dll links is what `ninja mpv` builds, read from the graph
+# configure wrote: `ninja -t inputs mpv` lists every file the target depends
+# on, transitively, and each ExternalProject step's stamp sits in
+# packages/<pkg>-prefix/src/<pkg>-stamp/. Ninja 1.11 (ubuntu-24.04, where CI
+# builds) and 1.13 print different phony nodes, but both print the stamps.
+STAMP_DIR = re.compile(r"(?:^|/)packages/([^/]+)-prefix/src/\1-stamp/")
+# Built for mpv, yet no code of theirs is in libmpv-2.dll: curl and the
+# libraries only it links (the pinned mpv has no libcurl option, see
+# MPV_MASTER_ONLY_OPTIONS, and ffmpeg's libcurl is off), subrandr (its mpv
+# option is master-only too) and the Vulkan loader (a DLL of its own, which
+# libmpv-2.dll imports). Re-audit when the winbuild or mpv pin moves.
+NOT_LINKED = frozenset({"c-ares", "curl", "libpsl", "nghttp2", "nghttp3", "ngtcp2", "subrandr", "vulkan"})
+# The toolchain packages whose runtime clang links into the DLL statically:
+# llvm (compiler-rt's builtins, libunwind, libc++ and libc++abi) and
+# mingw-w64 (the CRT and winpthreads). build.sh builds them as targets of
+# their own, so mpv's graph does not name them.
+TOOLCHAIN_RUNTIME = ("llvm", "mingw-w64")
+
+
+def source_package(package):
+    """The package whose source `package` builds: x265's per-bit-depth builds
+    (x265-8+10bit, x265-10bit-lib, ...) build x265's, and opus-dnn is the
+    model data opus compiles in."""
+    if package.startswith("x265-"):
+        return "x265"
+    return {"opus-dnn": "opus"}.get(package, package)
+
+
+def linked_packages(inputs):
+    """The winbuild packages whose code libmpv-2.dll links, sorted, from the
+    lines of `ninja -t inputs mpv`; pure for tests."""
+    built = {match.group(1) for line in inputs if (match := STAMP_DIR.search(line.strip()))}
+    if "mpv" not in built:
+        fail(
+            "`ninja -t inputs mpv` named no step of mpv; re-audit the "
+            "licence-source query against the winbuild commit"
+        )
+    return sorted({source_package(package) for package in built} - NOT_LINKED)
+
+
+def licence_folder(package):
+    """The folder of a package's licence texts: the versions.json name of a
+    pinned package (svtav1 is svt-av1), else the package name."""
+    pinned = {Path(relpath).stem: component for component, relpath in EXTRA_COMPONENTS.items()}
+    return pinned.get(package, package)
+
+
+def info_source_dir(text):
+    """The source_dir an ExternalProject <pkg>-gitinfo.txt or <pkg>-urlinfo.txt
+    records, or None; pure for tests."""
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key == "source_dir":
+            return value
+    return None
+
+
+def licence_sources(build, inputs):
+    """(licence folder, source dir) of every component libmpv-2.dll links,
+    sorted, from the winbuild build tree `build` and the lines of `ninja -C
+    <build> -t inputs mpv`.
+
+    The source dir is the one the package's ExternalProject recorded at
+    configure time beside its stamps: <pkg>-gitinfo.txt for a git package
+    (cloned into the shared src/), <pkg>-urlinfo.txt for a tarball (extracted
+    into the per-arch tree). A package whose source tree is missing or empty
+    fails.
+    """
+    rows = []
+    for subdir, packages in (("packages", linked_packages(inputs)), ("toolchain", TOOLCHAIN_RUNTIME)):
+        for package in packages:
+            stamp = Path(build) / subdir / f"{package}-prefix" / "src" / f"{package}-stamp"
+            infos = [path for path in (stamp / f"{package}-gitinfo.txt", stamp / f"{package}-urlinfo.txt")
+                     if path.is_file()]
+            if len(infos) != 1:
+                fail(f"{stamp}: expected exactly one of {package}-gitinfo.txt and {package}-urlinfo.txt")
+            source = info_source_dir(infos[0].read_text(encoding="utf-8"))
+            if source is None:
+                fail(f"{infos[0]}: no source_dir")
+            source = Path(source)
+            if not source.is_dir() or not any(source.iterdir()):
+                fail(f"{package}: no source tree at {source}")
+            rows.append((licence_folder(package), source))
+    return sorted(rows)
+
+
+def patch_sets(winbuild, versions):
+    """(source dir, commit, digest, patches) for every pinned package whose
+    rewritten file in an already-pinned winbuild checkout has a patch step.
+
+    The patches are the files its `git apply` glob expands to, in glob order.
+    The digest covers the commit and every patch's name and bytes, so any edit
+    to the series, a comment included, changes it. The patch step's command
+    line is a glob and does not change with the files, so build.sh compares
+    this digest instead (see check_patched_sources there).
+    """
+    rows = []
+    files = {component: f"packages/{component}.cmake" for component in COMPONENTS}
+    files.update(EXTRA_COMPONENTS)
+    for component, source_dir, pins in pinned_sources(versions):
+        package_file = Path(winbuild) / files[component]
+        if "PATCH_COMMAND" not in package_file.read_text(encoding="utf-8"):
+            continue
+        patches = sorted(package_file.parent.glob(f"{component}-*.patch"))
+        digest = hashlib.sha256(f"{pins['commit']}\n".encode())
+        for patch in patches:
+            digest.update(f"{patch.name}\n".encode())
+            digest.update(patch.read_bytes())
+        rows.append((source_dir, pins["commit"], digest.hexdigest(), patches))
+    return rows
+
+
+def holds_patches(source, commit, patches):
+    """Whether every file the patches touch holds, in the source's worktree,
+    exactly the bytes `git apply` of them onto `commit` produces.
+
+    Only the touched paths are compared, so build outputs written into the
+    source tree do not count. The expected tree is built in a scratch index,
+    leaving the source's own index and worktree untouched.
+    """
+    source = Path(source)
+    if not (source / ".git").exists():
+        return False
+    scratch = tempfile.NamedTemporaryFile(delete=False)
+    scratch.close()
+    env = dict(os.environ, GIT_INDEX_FILE=scratch.name)
+    try:
+        def git(*args, **kwargs):
+            return subprocess.run(["git", "-C", str(source), *args], env=env,
+                                  capture_output=True, text=True, **kwargs)
+        if git("read-tree", commit).returncode != 0:
+            return False
+        if patches and git("apply", "--cached", *map(str, patches)).returncode != 0:
+            return False
+        tree = git("write-tree").stdout.strip()
+        changed = git("diff", "--name-only", "-z", "--no-renames", commit, tree).stdout
+        for path in filter(None, changed.split("\0")):
+            listed = git("ls-tree", tree, "--", path).stdout.split()
+            expected = listed[2] if listed else None
+            target = source / path
+            actual = (git("hash-object", "--no-filters", "--", path).stdout.strip()
+                      if target.is_file() else None)
+            if actual != expected:
+                return False
+        return True
+    finally:
+        os.unlink(scratch.name)
+
+
+def patched_packages(build):
+    """Names of the packages whose patch stamp exists in a winbuild build tree
+    (<pkg>-stamp/<pkg>-patch), in one walk. Build and install trees hold no
+    stamps and are skipped."""
+    found = set()
+    for root, dirs, files in os.walk(build):
+        dirs[:] = [d for d in dirs if not d.endswith("-build") and d != "install"]
+        name = os.path.basename(root)
+        if name.endswith("-stamp") and f"{name[:-len('-stamp')]}-patch" in files:
+            found.add(name[:-len("-stamp")])
+    return found
+
+
+def patch_verdict(stamped, recorded, digest, held):
+    """(action, reason) for a package's cached source before this build, or
+    None when it can stay as it is.
+
+    A patch stamp may only stand beside the series and pin that produced it,
+    which the series digest recorded with the tree says. A recorded digest
+    that is not the current one ("purge"), or none at all (a tree cached
+    before digests were kept) under a source that does not hold the series,
+    resets the source and drops the package's stamps, so the package is
+    re-patched and rebuilt. At the recorded digest, a source that does not
+    hold the series is winbuild's own doing: its postremovebuild step resets
+    every git source to the pin after install, so a step re-run later (a
+    cascade, a liteclean) would compile it unpatched. That source gets the
+    series re-applied in place ("reapply") and nothing is rebuilt. Without a
+    stamp the patch step runs anyway, and its own reset makes it converge.
+    """
+    if not stamped:
+        return None
+    if recorded is not None and recorded != digest:
+        return ("purge", "its patch series or pin changed since it was patched")
+    if held:
+        return None
+    if recorded is None:
+        return ("purge", "its source does not hold the series its patch stamp claims, "
+                         "and no series was recorded with it")
+    return ("reapply", "its source is back at the pin under its patch stamp")
+
+
+def patch_state(winbuild, versions, sources, build, state):
+    """(source dir, commit, digest, action, patches, reason) for every package
+    with a patch step: action and reason are patch_verdict's, "keep" and ""
+    when the cached tree can stay; patches are the series' paths joined by
+    ":", "-" for none. Only the last field may be empty: build.sh reads the
+    rows with a tab IFS, which folds empty fields between tabs."""
+    stamped = patched_packages(build) if Path(build).is_dir() else set()
+    rows = []
+    for source_dir, commit, digest, patches in patch_sets(winbuild, versions):
+        record = Path(state) / source_dir
+        recorded = record.read_text(encoding="utf-8").strip() if record.is_file() else None
+        is_stamped = source_dir in stamped
+        held = is_stamped and holds_patches(Path(sources) / source_dir, commit, patches)
+        action, reason = patch_verdict(is_stamped, recorded, digest, held) or ("keep", "")
+        rows.append((source_dir, commit, digest, action,
+                     ":".join(map(str, patches)) or "-", reason))
+    return rows
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--winbuild", help="mpv-winbuild-cmake checkout to rewrite")
@@ -480,6 +703,21 @@ def main(argv):
         action="store_true",
         help="print the winbuild checkout's url and commit and exit",
     )
+    parser.add_argument(
+        "--print-licence-sources",
+        metavar="BUILD_DIR",
+        help="print <licence folder>=<source dir> for every component libmpv-2.dll "
+        "links, from a built winbuild tree (build/windows/<arch>), and exit",
+    )
+    parser.add_argument(
+        "--print-patch-state",
+        nargs=3,
+        metavar=("SOURCES_DIR", "BUILD_DIR", "STATE_DIR"),
+        help="with --winbuild (an already-pinned checkout): print <source dir> <commit> "
+        "<series digest> <reason> for every package with a patch step, reason "
+        "non-empty when its cached source in SOURCES_DIR must be reset before the "
+        "build in BUILD_DIR (digests recorded in STATE_DIR/<source dir>), and exit",
+    )
     args = parser.parse_args(argv)
 
     repo = Path(args.repo)
@@ -495,6 +733,22 @@ def main(argv):
     if args.print_winbuild_pin:
         pins = resolved_pins(versions, WINBUILD_COMPONENT)
         print(f"{pins['url']}\t{pins['commit']}")
+        return 0
+    if args.print_licence_sources:
+        build = Path(args.print_licence_sources)
+        query = subprocess.run(["ninja", "-C", str(build), "-t", "inputs", "mpv"],
+                               capture_output=True, text=True)
+        if query.returncode != 0:
+            fail(f"ninja -C {build} -t inputs mpv: {query.stderr.strip()}")
+        for folder, source in licence_sources(build, query.stdout.splitlines()):
+            print(f"{folder}={source}")
+        return 0
+    if args.print_patch_state:
+        if not args.winbuild:
+            parser.error("--print-patch-state needs --winbuild")
+        sources, build, state = args.print_patch_state
+        for row in patch_state(args.winbuild, versions, sources, build, state):
+            print("\t".join(row))
         return 0
     if not args.winbuild:
         parser.error("--winbuild is required")

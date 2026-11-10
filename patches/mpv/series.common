@@ -8,6 +8,7 @@
 0034-player-drop-the-frame-held-for-the-old-ao-on-reload.patch
 0035-demux-dts-codec-profile-at-load.patch
 0208-demux-keep-the-first-new-packet-after-a-refresh-seek.patch
+0210-player-sync-restored-video-to-running-audio.patch
 # Codec profile at load and the pending-vid property, for the per-file decode
 # routing an embedder decides before the decoder exists.
 0204-demux-codec-profile-from-avcc-and-hvcc.patch
@@ -28,9 +29,23 @@
 0013-sd-ass-isolate-event-prefetch-renderer.patch
 0014-ass-mp-compact-high-overdraw-atlases.patch
 0031-vo-osd-ahead-shared-subtitle-render-pipeline.patch
+0214-osd-ahead-repeat-an-unchanged-frame-on-request.patch
 # deinterlace=ivtc and the ivtc-active property (needs the fieldmatch and
 # decimate filters every group's FFmpeg enables).
 0207-f-auto-filters-inverse-telecine-deinterlace-mode.patch
 # FFmpeg's log lines reach the instance whose thread logged them, with
 # several instances alive at once.
 0209-av-log-route-ffmpeg-lines-to-their-own-instance.patch
+# hwdec=auto no longer picks Vulkan decoding (mpv master d20d108d94).
+0211-vd-lavc-remove-vulkan-hwdec-from-auto-safe-selection.patch
+# Fewer player wakeups during playback: the cache and OSD refreshes done on
+# playback's own wakeups instead of timers of their own (--coalesce-updates,
+# off by default).
+0212-player-periodic-refreshes-on-playbacks-own-wakeups.patch
+# --demuxer-hysteresis-secs also spares the demuxer thread its per-packet
+# wakeup while the hysteresis holds (no change at the default 0).
+0213-demux-let-the-hysteresis-keep-the-demuxer-thread-asleep.patch
+# A libass frame that only moves or recolors the previous frame's bitmaps
+# keeps its packed atlas (and atlas_id), and new atlases come from a small
+# pool of free ones (--sub-ass-atlas-reuse, --sub-ass-atlas-pool).
+0215-sub-keep-the-ass-atlas-when-only-positions-or-colors-change.patch

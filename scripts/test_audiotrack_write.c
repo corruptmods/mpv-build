@@ -127,6 +127,25 @@ static void mp_thread_set_name(const char *name) { (void)name; }
 static int64_t mp_time_ns(void) { return atomic_load(&now_ns); }
 static int64_t mp_raw_time_ns(void) { return mp_time_ns(); }
 static int64_t mp_time_ns_from_raw_time(int64_t ns) { return ns; }
+// set_pause reads a resumed passthrough track's head between sleeps
+// (AudioTrack_awaitResumedHead). A sleep advances the fake clock by what it
+// asked for. On sleep number resume_moves_at the device starts rendering
+// (tracks[0].head advances by resume_step); on sleep number sleep_hook_at
+// sleep_hook_fn runs, standing in for the worker reading the clock meanwhile.
+static int sleeps, resume_moves_at, sleep_hook_at;
+static uint32_t resume_step;
+static void (*sleep_hook_fn)(void);
+static void mp_sleep_ns(int64_t ns)
+{
+    atomic_fetch_add(&now_ns, ns);
+    mp_mutex_lock(&gate);
+    const int n = ++sleeps;
+    if (n == resume_moves_at)
+        tracks[0].head += resume_step;
+    mp_mutex_unlock(&gate);
+    if (n == sleep_hook_at && sleep_hook_fn)
+        sleep_hook_fn();
+}
 // Verbose lines are discarded except the playhead-step diagnostic, which the
 // step check reads back.
 static int step_lines;
@@ -171,13 +190,20 @@ static void err_log(const char *fmt, ...)
 #define MP_ERR(ao, ...) err_log(__VA_ARGS__)
 
 static int64_t last_wait_ns; // what the worker asked its latest wait for
+// What the worker asked wait number n (idle's count once it began) for, and
+// whether that wait ran its whole time rather than being signalled, for the
+// last MP_ARRAY_SIZE(wait_log) waits.
+static int64_t wait_log[64];
+static bool wait_timed_out[64];
 
 static void mp_cond_timedwait(mp_cond *c, mp_mutex *m, int64_t ns)
 {
     // The worker publishes its completed accounting before entering this wait.
     mp_mutex_lock(&gate);
-    idle++;
+    const int number = ++idle;
     last_wait_ns = ns;
+    wait_log[number % MP_ARRAY_SIZE(wait_log)] = ns;
+    wait_timed_out[number % MP_ARRAY_SIZE(wait_log)] = false;
     pthread_cond_broadcast(&changed);
     mp_mutex_unlock(&gate);
     struct timespec until;
@@ -186,7 +212,10 @@ static void mp_cond_timedwait(mp_cond *c, mp_mutex *m, int64_t ns)
     until.tv_nsec += ns % 1000000000;
     until.tv_sec += until.tv_nsec / 1000000000;
     until.tv_nsec %= 1000000000;
-    pthread_cond_timedwait(c, m, &until);
+    const bool timed_out = pthread_cond_timedwait(c, m, &until) == ETIMEDOUT;
+    mp_mutex_lock(&gate);
+    wait_timed_out[number % MP_ARRAY_SIZE(wait_log)] = timed_out;
+    mp_mutex_unlock(&gate);
 }
 
 static struct {
@@ -459,6 +488,9 @@ static void setup(struct fixture *f, bool raw, int format, bool direct)
     new_failures = 0;
     response = input_bytes = track_count = underrun_queries = step_lines = 0;
     last_write_count = 0;
+    sleeps = resume_moves_at = sleep_hook_at = 0;
+    resume_step = 0;
+    sleep_hook_fn = NULL;
     atomic_store(&hook_lock, NULL);
     hook_after_warning = NULL;
     atomic_store(&watched_lock, NULL);
@@ -511,8 +543,9 @@ static void begin_write(struct fixture *f, const uint8_t *bytes, int len)
     wait_counter(&entered, target);
 }
 
-// A track left PLAYING parks the worker inside a zero-length JNI write that
-// teardown cannot reach; pause it and release the blocked call first.
+// A track left PLAYING can leave the worker inside a JNI write the device
+// holds, which teardown cannot reach; pause it and release the blocked call
+// first.
 static void park_worker(struct fixture *f)
 {
     mp_mutex_lock(&gate);
@@ -951,16 +984,19 @@ static void check_recreate_stop_start_during_retry(void)
 }
 
 // The worker's write in progress completes (the device takes it whole), and
-// the hook waits for the worker's next write before it returns.
+// the hook waits for the worker's next pass before it returns: the core has
+// nothing more, so that pass is the wait for its audio (or, on a worker that
+// wrote empty reads, a zero-length write). Either one shows the worker went
+// round after the write without finding a recreate request.
 static int completed_len; // what that write asked the track to take
 static void complete_write_then_wait_for_the_next(void)
 {
     mp_mutex_lock(&gate);
     response = completed_len;
     permitted = entered;
-    int target = entered + 1;
+    int writes = entered, polls = idle;
     pthread_cond_broadcast(&changed);
-    while (entered < target)
+    while (entered == writes && idle == polls)
         pthread_cond_wait(&changed, &gate);
     mp_mutex_unlock(&gate);
 }
@@ -972,10 +1008,10 @@ static void complete_write_then_wait_for_the_next(void)
 // lands on that replacement, which stays paused with nothing outstanding and
 // so no verdict to come, and with --audio-stream-silence no stop()/start()
 // from the core either. The hook has the device take the write at the moment
-// the monitor reaches for track_lock, and returns once the worker is in its
-// next write: on this code the worker finds no request yet and writes an
-// empty read to the old track; stored first, it would make the replacement
-// before the pause.
+// the monitor reaches for track_lock, and returns once the worker has come
+// round again: on this code the worker finds no request yet and waits for
+// the core's audio on the old track; stored first, it would make the
+// replacement before the pause.
 static void check_recreate_request_meets_completed_write(void)
 {
     struct fixture f;
@@ -1007,19 +1043,25 @@ static void check_recreate_request_meets_completed_write(void)
     assert(!pthread_join(f.p.monitor, NULL));
     f.p.monitor_created = false;
 
-    // The pause released the worker's write (nothing taken). The worker
-    // answers the request now: the old track goes, the replacement is made
-    // playing, and the worker's next write goes to it.
+    // The worker answers the request now (released from its wait for the
+    // core, or from a zero-length write the pause left it in, nothing
+    // taken): the old track goes, the replacement is made playing, and the
+    // core's next audio is written to it. A worker idling on a paused track
+    // waits 300 ms at a time, which ends the wait here as a failure rather
+    // than a hang.
     mp_mutex_lock(&gate);
     int writes = entered, polls = idle;
+    memcpy(input, audio, sizeof(audio));
+    input_bytes = sizeof(audio);
     response = 0;
     permitted = entered;
     pthread_cond_broadcast(&changed);
-    while (entered == writes && idle == polls)
+    while (entered == writes && !(idle > polls && last_wait_ns > KA_IDLE_NS))
         pthread_cond_wait(&changed, &gate);
     assert(track_count == 2 && tracks[0].released);
     assert(tracks[1].state == AudioTrack.PLAYSTATE_PLAYING);
     assert(entered > writes); // writing to the replacement, not idling on a paused one
+    assert(!input_bytes && last_write_count == sizeof(audio));
     mp_mutex_unlock(&gate);
     assert(!atomic_load(&f.p.recreate_requested));
     assert(atomic_load(&f.p.recovery_attempts) == 1 && !failures);
@@ -1040,6 +1082,7 @@ static void check_recreate_request_meets_completed_write(void)
 // attempt, stop() would find neither a track nor a request in that window.
 static struct fixture *attempt_f;
 static pthread_t attempt_caller;
+static int seek_at_lock; // watched_waits once stop() has reached p->lock
 static void *stop_and_start(void *arg)
 {
     struct ao *ao = arg;
@@ -1056,15 +1099,15 @@ static void seek_during_the_attempt(void)
     atomic_store(&watched_lock, &attempt_f->p.track_lock);
     assert(!pthread_create(&attempt_caller, NULL, stop_and_start, &attempt_f->ao));
     wait_counter(&watched_waits, target); // stop() waits for track_lock
-    atomic_store(&watched_lock, NULL);
+    // Watch p->lock from now on, while the worker still holds track_lock:
+    // stop() can reach p->lock the moment the worker releases it, before
+    // the unlock hook runs.
+    seek_at_lock = target + 1;
+    atomic_store(&watched_lock, &attempt_f->p.lock);
 }
 static void let_the_seek_through(void)
 {
-    mp_mutex_lock(&gate);
-    int target = watched_waits + 1;
-    mp_mutex_unlock(&gate);
-    atomic_store(&watched_lock, &attempt_f->p.lock);
-    wait_counter(&watched_waits, target); // stop() is through track_lock, at p->lock
+    wait_counter(&watched_waits, seek_at_lock); // stop() is through track_lock, at p->lock
     atomic_store(&watched_lock, NULL);
 }
 
@@ -2365,6 +2408,147 @@ static void check_stream_silence_polls(void)
          "track stood down backs off to 50 ms");
 }
 
+// From wait number `from` on, the worker waits for the core's audio with
+// nothing written: KA_POLL_NS first, each wait double the one before up to
+// KA_IDLE_NS, until three in a row are at KA_IDLE_NS. Returns the number of
+// the last of them.
+static int expect_backoff(int from)
+{
+    mp_mutex_lock(&gate);
+    const int writes = entered;
+    int64_t last = 0;
+    int at_idle = 0, n = from;
+    for (; at_idle < 3; n++) {
+        assert(n - from < 20);
+        while (idle < n)
+            pthread_cond_wait(&changed, &gate);
+        assert(idle - n < MP_ARRAY_SIZE(wait_log));
+        const int64_t wait = wait_log[n % MP_ARRAY_SIZE(wait_log)];
+        assert(wait == (last ? MPMIN(last * 2, KA_IDLE_NS) : KA_POLL_NS));
+        if (wait == KA_IDLE_NS)
+            at_idle++;
+        last = wait;
+    }
+    assert(entered == writes); // no zero-length writes in between
+    mp_mutex_unlock(&gate);
+    return n - 1;
+}
+
+// A playing PCM track whose core has no audio (the audio ended before the
+// video, or an underrun the core does not pause the AO for): the worker
+// writes nothing and waits, backing off to KA_IDLE_NS. Audio the core gets
+// back without a start() goes out at the end of the wait in progress, and
+// the waits start over at KA_POLL_NS behind it. A start() (a seek or a
+// resume) ends the wait at once.
+static void check_empty_core_waits(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    pause_after_write = false; // the track plays on, the core empty
+    static const uint8_t audio[6] = {1, 2, 3, 4, 5, 6};
+    begin_write(&f, audio, sizeof(audio));
+    mp_mutex_lock(&gate);
+    int from = idle + 1;
+    mp_mutex_unlock(&gate);
+    finish_write(&f, sizeof(audio));
+    int last = expect_backoff(from);
+
+    // An underrun the core recovers from without a start(): nothing wakes
+    // the worker, so the audio waits for the wait in progress to end, and
+    // no longer (the backoff kept every wait at KA_IDLE_NS or under).
+    mp_mutex_lock(&gate);
+    int polls = idle, writes = entered;
+    memcpy(input, audio, sizeof(audio));
+    input_bytes = sizeof(audio);
+    while (entered == writes)
+        pthread_cond_wait(&changed, &gate);
+    assert(idle - polls <= 1 && !input_bytes && last_write_count == sizeof(audio));
+    from = idle + 1;
+    mp_mutex_unlock(&gate);
+    finish_write(&f, sizeof(audio));
+    last = expect_backoff(from); // starts over at KA_POLL_NS
+    int written = 2;
+
+    // start() ends a KA_IDLE_NS wait at once: the write follows the wait
+    // that was in progress, which did not run out. Each try finds the worker
+    // inside such a wait (p->lock is free only there). A try whose wait ran
+    // out anyway (the test thread starved for 50 ms) goes again; none in
+    // five is a worker that start() does not wake.
+    bool woke = false;
+    for (int attempt = 0; attempt < 5 && !woke; attempt++) {
+        mp_mutex_lock(&f.p.lock);
+        mp_mutex_unlock(&f.p.lock);
+        mp_mutex_lock(&gate);
+        const int waiting = idle;
+        assert(waiting >= last && wait_log[waiting % MP_ARRAY_SIZE(wait_log)] == KA_IDLE_NS);
+        writes = entered;
+        memcpy(input, audio, sizeof(audio));
+        input_bytes = sizeof(audio);
+        mp_mutex_unlock(&gate);
+        start(&f.ao);
+        mp_mutex_lock(&gate);
+        while (entered == writes)
+            pthread_cond_wait(&changed, &gate);
+        woke = idle == waiting && !wait_timed_out[waiting % MP_ARRAY_SIZE(wait_log)];
+        from = idle + 1;
+        mp_mutex_unlock(&gate);
+        finish_write(&f, sizeof(audio));
+        written++;
+        last = expect_backoff(from);
+    }
+    assert(woke);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.written_frames == (uint32_t)(written * sizeof(audio) / f.ao.sstride));
+    mp_mutex_unlock(&f.p.lock);
+    assert(!warnings && !failures && !errors);
+    teardown(&f);
+    puts("PASS: a playing track whose core is empty waits instead of writing, "
+         "backing off to 50 ms; audio after it goes out within one wait, and a "
+         "start() ends the wait at once");
+}
+
+// TrueHD units the reassembly completed into whole groups go out though the
+// core has nothing more: the group is the write, not the core's read.
+static void check_empty_core_writes_complete_truehd_groups(void)
+{
+    struct fixture f;
+    setup(&f, true, 14, true);
+    f.ao.format = AF_FORMAT_S_TRUEHD;
+    pause_after_write = false;
+    uint8_t units[THD_GROUP_UNITS * 4];
+    for (int n = 0; n < THD_GROUP_UNITS; n++) {
+        // A 4-byte unit: its first word's low 12 bits are its length in words.
+        const uint8_t unit[4] = {0x00, 0x02, (uint8_t)n, 0xa5};
+        memcpy(units + 4 * n, unit, 4);
+    }
+    mp_mutex_lock(&f.p.lock);
+    memcpy(f.p.rawbuf, units, sizeof(units));
+    f.p.thd_fill = f.p.thd_complete_end = sizeof(units);
+    f.p.thd_complete = THD_GROUP_UNITS;
+    mp_mutex_unlock(&f.p.lock);
+    mp_mutex_lock(&gate);
+    int writes = entered, polls = idle;
+    mp_mutex_unlock(&gate);
+    start(&f.ao);
+    mp_mutex_lock(&gate);
+    // A worker that waits instead fails here after three waits, not at the alarm.
+    while (entered == writes && idle < polls + 3)
+        pthread_cond_wait(&changed, &gate);
+    assert(entered == writes + 1 && last_write_count == (int)sizeof(units));
+    int from = idle + 1;
+    mp_mutex_unlock(&gate);
+    finish_write(&f, sizeof(units));
+    assert(tracks[0].sink_size == (int)sizeof(units));
+    assert(!memcmp(tracks[0].sink, units, sizeof(units)));
+    mp_mutex_lock(&f.p.lock);
+    assert(!f.p.thd_complete && !f.p.thd_fill && !f.p.raw_pending);
+    mp_mutex_unlock(&f.p.lock);
+    expect_backoff(from); // nothing is left, and the worker waits
+    assert(!warnings && !failures && !errors);
+    teardown(&f);
+    puts("PASS: an empty core still has complete TrueHD groups written");
+}
+
 // the rate the frames are encoded at; the IEC 61937 carrier gets zero words
 // at any rate. Reads are sized to the format's largest burst where silence
 // is on, and left alone where it is not.
@@ -2692,7 +2876,7 @@ static void check_pcm_stale_timestamp_after_flush(void)
     begin_write(&f, data, sizeof(data));
     finish_write(&f, 8);
     mp_mutex_lock(&gate);
-    response = 0; // a parked zero-write must not credit stale frames
+    response = 0; // a write while the test plays the track must credit nothing
     mp_mutex_unlock(&gate);
 
     // Both counters advance together; the timestamp anchors to the head's
@@ -2735,7 +2919,7 @@ static void check_pcm_healthy_counters_after_flush(void)
     begin_write(&f, data, sizeof(data));
     finish_write(&f, 8);
     mp_mutex_lock(&gate);
-    response = 0; // a parked zero-write must not credit stale frames
+    response = 0; // a write while the test plays the track must credit nothing
     mp_mutex_unlock(&gate);
     for (int n = 0; n < 4; n++) {
         atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(60));
@@ -3064,7 +3248,7 @@ static void check_pause_requalifies_the_timestamp(void)
     begin_write(&f, data, sizeof(data));
     finish_write(&f, 16);
     mp_mutex_lock(&gate);
-    response = 0; // a parked zero-write must not credit stale frames
+    response = 0; // a write while the test plays the track must credit nothing
     tracks[0].timestamp_ok = true;
     mp_mutex_unlock(&gate);
     for (int n = 0; n < 3; n++) {
@@ -3096,6 +3280,22 @@ static void check_pause_requalifies_the_timestamp(void)
     puts("PASS: a pause requalifies the timestamp instead of extrapolating it across the pause");
 }
 
+// 10000 frames written and three 40 ms polls of a head that plays them, so
+// the passthrough smoother has a window to carry.
+static void run_passthrough_clock(struct fixture *f)
+{
+    mp_mutex_lock(&f->p.lock);
+    f->p.written_frames = 10000;
+    mp_mutex_unlock(&f->p.lock);
+    for (int n = 1; n <= 3; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(40));
+        mp_mutex_lock(&gate);
+        tracks[0].head = 1920 * n;
+        mp_mutex_unlock(&gate);
+        expect_delay_played(f, 10000, 1920 * n);
+    }
+}
+
 // The passthrough clock is the smoothed head. A pause stands the head still
 // while the clock runs on; carried across it, the smoothing window would read
 // the pause as a jump and report the buffer drained. The pause restarts the
@@ -3104,16 +3304,7 @@ static void check_pause_restarts_the_passthrough_smoother(void)
 {
     struct fixture f;
     setup(&f, false, AudioFormat.ENCODING_IEC61937, true);
-    mp_mutex_lock(&f.p.lock);
-    f.p.written_frames = 10000;
-    mp_mutex_unlock(&f.p.lock);
-    for (int n = 1; n <= 3; n++) {
-        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(40));
-        mp_mutex_lock(&gate);
-        tracks[0].head = 1920 * n;
-        mp_mutex_unlock(&gate);
-        expect_delay_played(&f, 10000, 1920 * n);
-    }
+    run_passthrough_clock(&f);
 
     set_pause(&f.ao, true);
     atomic_fetch_add(&now_ns, MP_TIME_S_TO_NS(1));
@@ -3122,6 +3313,78 @@ static void check_pause_restarts_the_passthrough_smoother(void)
     park_worker(&f);
     teardown(&f);
     puts("PASS: a pause restarts the passthrough smoother instead of reading as a jump");
+}
+
+static struct fixture *sleep_fixture;
+
+// The worker reading the clock while the resumed head still stands.
+static void read_the_standing_clock(void)
+{
+    mp_mutex_lock(&sleep_fixture->p.lock);
+    int64_t sample_time = 0;
+    (void)AudioTrack_getLatency(&sleep_fixture->ao, &sample_time);
+    mp_mutex_unlock(&sleep_fixture->p.lock);
+}
+
+// Plezy #2302: a resumed passthrough track renders nothing until the HAL has
+// restarted the bitstream, 55-72 ms on a DTS track. buffer.c restarts the
+// core's clock when set_pause returns, so set_pause returns once the head
+// moves, not at play(). The smoother then starts on the moving head: a
+// sample the worker took while the head stood would read as the same step.
+static void check_resume_waits_for_the_passthrough_head(bool raw)
+{
+    struct fixture f;
+    setup(&f, raw, raw ? 7 /* ENCODING_DTS */ : AudioFormat.ENCODING_IEC61937, true);
+    run_passthrough_clock(&f);
+    set_pause(&f.ao, true);
+    atomic_fetch_add(&now_ns, MP_TIME_S_TO_NS(1));
+
+    // The head stands through 30 polls; the worker reads the clock after 10.
+    sleep_fixture = &f;
+    sleep_hook_fn = read_the_standing_clock;
+    sleep_hook_at = 10;
+    resume_moves_at = 30;
+    resume_step = 480;
+    const int64_t resumed = atomic_load(&now_ns);
+    set_pause(&f.ao, false);
+    assert(plays == 1 && sleeps == 30);
+    assert(atomic_load(&now_ns) - resumed == 30 * RESUME_HEAD_POLL_NS);
+    expect_delay_played(&f, 10000, 5760 + 480);
+    park_worker(&f);
+    teardown(&f);
+}
+
+// A head that never moves again holds the resume no longer than
+// RESUME_HEAD_WAIT_NS; the stall monitor owns a device that stays dead.
+static void check_resume_wait_is_bounded(void)
+{
+    struct fixture f;
+    setup(&f, false, AudioFormat.ENCODING_IEC61937, true);
+    run_passthrough_clock(&f);
+    set_pause(&f.ao, true);
+    const int64_t resumed = atomic_load(&now_ns);
+    set_pause(&f.ao, false);
+    const int64_t waited = atomic_load(&now_ns) - resumed;
+    assert(plays == 1);
+    assert(waited >= RESUME_HEAD_WAIT_NS && waited < RESUME_HEAD_WAIT_NS + RESUME_HEAD_POLL_NS);
+    expect_delay_played(&f, 10000, 5760);
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a resumed passthrough head that never moves holds the resume for a bounded time");
+}
+
+// A PCM track resumes at once: its clock is the timestamp the pause
+// requalified, and 0141 measured no late frame after a resume.
+static void check_pcm_resume_does_not_wait(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    set_pause(&f.ao, true);
+    set_pause(&f.ao, false);
+    assert(plays == 1 && !sleeps);
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a PCM resume does not wait for the head");
 }
 
 // A pause that outlasts the stall timeout is no stall: the monitor stands by
@@ -3167,7 +3430,10 @@ static void check_pause_outlasts_the_stall_timeout(void)
 
 int main(void)
 {
-    alarm(15); // fail a regression that holds the reset lock, rather than hang CI
+    // Fail a regression that holds the reset lock, rather than hang CI. The
+    // alarm covers the whole suite, whose real-time waits take 9 s on an M5 Pro
+    // and reached 15 s on a CI runner, so it leaves room for both.
+    alarm(60);
     check_raw_partial_reset();
     check_raw_dtshd(13, 48000, 1);
     check_raw_dtshd(14, 96000, 2);
@@ -3201,6 +3467,8 @@ int main(void)
     check_stream_silence_queue_cap();
     check_stream_silence_queue_cap_carrier();
     check_stream_silence_polls();
+    check_empty_core_waits();
+    check_empty_core_writes_complete_truehd_groups();
     check_stream_silence_init_rate();
     check_watchdog_after_reset();
     check_underrun_reporting();
@@ -3222,6 +3490,11 @@ int main(void)
     check_pause_keeps_the_raw_rest();
     check_pause_requalifies_the_timestamp();
     check_pause_restarts_the_passthrough_smoother();
+    check_resume_waits_for_the_passthrough_head(false);
+    check_resume_waits_for_the_passthrough_head(true);
+    puts("PASS: a passthrough resume returns once the head moves and restarts the smoother on it");
+    check_resume_wait_is_bounded();
+    check_pcm_resume_does_not_wait();
     check_pause_outlasts_the_stall_timeout();
     check_truehd_stall_demotes(); // last: the demotion is process-wide
     return 0;

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Exercise OSD retirement from the final Android patch series. Pass an already-
-# patched mpv tree for offline use; otherwise fetch and patch the pinned source.
+# Exercise live OSD surface replacement from the final Android patch series,
+# without rebuilding the video decoder: retirement waits for the old producer,
+# releases its window exactly once, and starts the replacement without stale
+# requests or timing state. Pass an already-patched mpv tree for offline use;
+# otherwise fetch and patch the pinned source.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_dir="${1:-}"
@@ -22,7 +25,7 @@ python3 "$root/scripts/extract.py" symbol "$source_dir/video/out/osd_ahead.c" \
     --fn osd_ahead_stop --fn osd_ahead_destroy
 python3 "$root/scripts/extract.py" symbol "$source_dir/video/out/vo_mediacodec.c" \
     "$workdir/mediacodec_rebind.inc" --append --return void \
-    --fn osd_init --fn osd_uninit --fn update_opts
+    --fn osd_set_vsync_delay --fn osd_init --fn osd_uninit --fn update_opts
 cc -std=c11 -Wall -Wextra -Werror -pthread -I"$workdir" \
     "$root/scripts/test_mediacodec_rebind.c" -o "$workdir/test"
 "$workdir/test"

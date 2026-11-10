@@ -11,7 +11,10 @@ Run: python3 platforms/windows/test_pin_packages.py
 
 import hashlib
 import json
+import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -44,6 +47,96 @@ index 0000000..1111111 100644
 -old
 +new
 """
+
+# `ninja -t inputs mpv` lines for a few packages of the pinned winbuild's
+# x86_64 graph, as ninja 1.11.1 (ubuntu-24.04, where CI builds) and 1.13.2
+# print them: 1.11 names each package's phony nodes and leaves out mpv-done,
+# 1.13 names CMakeFiles/<pkg>-complete instead. Both name the step stamps.
+NINJA_1_11_INPUTS = """\
+packages/curl
+packages/curl-download
+packages/curl-prefix/src/curl-stamp/curl-done
+packages/curl-prefix/src/curl-stamp/curl-download
+packages/curl-prefix/src/curl-stamp/curl-gitinfo.txt
+packages/libass
+packages/libass-download
+packages/libass-prefix/src/libass-stamp/libass-done
+packages/libass-prefix/src/libass-stamp/libass-download
+packages/libass-prefix/src/libass-stamp/libass-gitinfo.txt
+packages/mpv-download
+packages/mpv-prefix/src/mpv-stamp/mpv-download
+packages/mpv-prefix/src/mpv-stamp/mpv-gitinfo.txt
+packages/opus-dnn
+packages/opus-dnn-download
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-done
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-download
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-urlinfo.txt
+packages/svtav1
+packages/svtav1-download
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-done
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-download
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-gitinfo.txt
+packages/x265
+packages/x265-8+10bit
+packages/x265-8+10bit-download
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-custominfo.txt
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-done
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-download
+packages/x265-download
+packages/x265-prefix/src/x265-stamp/x265-done
+packages/x265-prefix/src/x265-stamp/x265-download
+packages/x265-prefix/src/x265-stamp/x265-gitinfo.txt
+"""
+NINJA_1_13_INPUTS = """\
+packages/CMakeFiles/curl-complete
+packages/CMakeFiles/libass-complete
+packages/CMakeFiles/mpv-complete
+packages/CMakeFiles/opus-dnn-complete
+packages/CMakeFiles/svtav1-complete
+packages/CMakeFiles/x265-8+10bit-complete
+packages/CMakeFiles/x265-complete
+packages/curl-prefix/src/curl-stamp/curl-done
+packages/curl-prefix/src/curl-stamp/curl-download
+packages/curl-prefix/src/curl-stamp/curl-gitinfo.txt
+packages/libass-prefix/src/libass-stamp/libass-done
+packages/libass-prefix/src/libass-stamp/libass-download
+packages/libass-prefix/src/libass-stamp/libass-gitinfo.txt
+packages/mpv-prefix/src/mpv-stamp/mpv-done
+packages/mpv-prefix/src/mpv-stamp/mpv-download
+packages/mpv-prefix/src/mpv-stamp/mpv-gitinfo.txt
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-done
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-download
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-urlinfo.txt
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-done
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-download
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-gitinfo.txt
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-custominfo.txt
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-done
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-download
+packages/x265-prefix/src/x265-stamp/x265-done
+packages/x265-prefix/src/x265-stamp/x265-download
+packages/x265-prefix/src/x265-stamp/x265-gitinfo.txt
+"""
+# What both say libmpv-2.dll links: curl dropped, opus-dnn folded into opus
+# and x265's 8+10-bit build into x265.
+NINJA_LINKED = ["libass", "mpv", "opus", "svtav1", "x265"]
+
+
+def plant_package(build, subdir, package, info, source):
+    """A configured package in a synthetic winbuild build tree: the info file
+    ExternalProject writes beside the stamps, in its real shape, and a source
+    tree holding one file."""
+    stamp = build / subdir / f"{package}-prefix" / "src" / f"{package}-stamp"
+    stamp.mkdir(parents=True)
+    (stamp / f"{package}-{info}info.txt").write_text(
+        "# This is a generated file and its contents are an internal implementation detail.\n"
+        "# The download step will be re-executed if anything in this file changes.\n"
+        "# No other meaning or use of this file is supported.\n\n"
+        f"method={info}\nsource_dir={source}\nwork_dir={source.parent}\n",
+        encoding="utf-8",
+    )
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "COPYING").write_text("licence\n", encoding="utf-8")
 
 
 def first_word(line):
@@ -260,6 +353,26 @@ class PinPackagesTest(unittest.TestCase):
         self.assertTrue(pin_packages.upstream_patch_step(pinned, "openssl"))
         self.assertEqual(pin_packages.rewrite(pinned, "openssl", pins, True), pinned)
 
+    def test_fontconfig_main_tip_becomes_the_pinned_commit(self):
+        # winbuild builds fontconfig's main tip and git-ams its own patches;
+        # upstream dff5c35 broke them. The rewrite pins the commit they apply
+        # to, replaces upstream's GIT_TAG main and keeps the patches as git apply.
+        text = (TESTDATA / "fontconfig.cmake").read_text(encoding="utf-8")
+        self.assertIn("    GIT_TAG main\n", text)
+        self.assertIn("git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/fontconfig-*.patch", text)
+        pins = self.pins["fontconfig"]
+        pinned = pin_packages.rewrite(text, "fontconfig", pins, True)
+        self.assertIn(
+            "    PATCH_COMMAND ${EXEC} "
+            f'"git reset --hard {pins["commit"]} -q '
+            '&& git apply ${CMAKE_CURRENT_SOURCE_DIR}/fontconfig-*.patch"\n',
+            pinned,
+        )
+        self.assertIn(f"    GIT_TAG {pins['commit']}\n", pinned)
+        self.assertNotIn("GIT_TAG main", pinned)
+        self.assertEqual(keyword_sequence(pinned, {"GIT_TAG"}), ["GIT_TAG"])
+        self.assertEqual(pin_packages.rewrite(pinned, "fontconfig", pins, True), pinned)
+
     def test_unrecognized_upstream_patch_step_fails(self):
         # A winbuild bump that reshapes an extra's patch step must be audited,
         # not silently dropped by the strip.
@@ -412,6 +525,278 @@ class PinPackagesTest(unittest.TestCase):
         versions = {"components": {"mpv": {"version": "v1", "url": "u", "ref": "v1"}}}
         with self.assertRaises(SystemExit):
             pin_packages.resolved_pins(versions, "mpv")
+
+    def test_linked_packages_from_either_ninja(self):
+        for name, inputs in (("1.11", NINJA_1_11_INPUTS), ("1.13", NINJA_1_13_INPUTS)):
+            with self.subTest(ninja=name):
+                self.assertEqual(pin_packages.linked_packages(inputs.splitlines()), NINJA_LINKED)
+        # Every x265 bit-depth build folds into x265, and a not-linked package
+        # is dropped wherever the graph names it.
+        lines = [f"packages/{p}-prefix/src/{p}-stamp/{p}-done"
+                 for p in ("mpv", "x265-10bit", "x265-10bit-lib", "vulkan", "subrandr", "nghttp3")]
+        self.assertEqual(pin_packages.linked_packages(lines), ["mpv", "x265"])
+
+    def test_linked_packages_fails_without_mpv(self):
+        # A query that names no mpv step read the wrong target or a graph
+        # whose layout moved; an empty or partial list must not ship.
+        lines = [line for line in NINJA_1_13_INPUTS.splitlines() if "mpv" not in line]
+        with self.assertRaises(SystemExit):
+            pin_packages.linked_packages(lines)
+        with self.assertRaises(SystemExit):
+            pin_packages.linked_packages([])
+
+    def test_licence_folders_are_the_keyed_component_names(self):
+        # check --group windows requires a folder per group.json component
+        # (but the build system's own, which ships no text), so the folders of
+        # the pinned packages have to be those names.
+        group = json.loads((HERE / "group.json").read_text(encoding="utf-8"))
+        keyed = set(group["artifacts"]["libmpv-windows"]["components"]) - {pin_packages.WINBUILD_COMPONENT}
+        stems = list(pin_packages.COMPONENTS) + [Path(r).stem for r in pin_packages.EXTRA_COMPONENTS.values()]
+        self.assertLessEqual(keyed, {pin_packages.licence_folder(stem) for stem in stems})
+        self.assertEqual(pin_packages.licence_folder("svtav1"), "svt-av1")
+        self.assertEqual(pin_packages.licence_folder("nvcodec-headers"), "nv-codec-headers")
+        self.assertEqual(pin_packages.licence_folder("freetype2"), "freetype2")
+
+    def test_licence_sources_are_the_recorded_source_dirs(self):
+        build = self.tmp / "x86_64"
+        src = self.tmp / "src"
+        for package in ("libass", "mpv", "svtav1", "x265"):
+            plant_package(build, "packages", package, "git", src / package)
+        opus = build / "packages" / "opus-prefix" / "src" / "opus"
+        plant_package(build, "packages", "opus", "url", opus)
+        for package in pin_packages.TOOLCHAIN_RUNTIME:
+            plant_package(build, "toolchain", package, "git", src / package)
+        self.assertEqual(
+            pin_packages.licence_sources(build, NINJA_1_11_INPUTS.splitlines()),
+            [("libass", src / "libass"), ("llvm", src / "llvm"), ("mingw-w64", src / "mingw-w64"),
+             ("mpv", src / "mpv"), ("opus", opus), ("svt-av1", src / "svtav1"), ("x265", src / "x265")],
+        )
+        # ExternalProject creates every SOURCE_DIR at configure time, so an
+        # empty one is a source that was never fetched or has gone.
+        (opus / "COPYING").unlink()
+        with self.assertRaises(SystemExit):
+            pin_packages.licence_sources(build, NINJA_1_11_INPUTS.splitlines())
+        shutil.rmtree(opus)
+        with self.assertRaises(SystemExit):
+            pin_packages.licence_sources(build, NINJA_1_11_INPUTS.splitlines())
+
+    def test_licence_sources_need_the_package_configured(self):
+        build = self.tmp / "x86_64"
+        plant_package(build, "packages", "mpv", "git", self.tmp / "src" / "mpv")
+        with self.assertRaises(SystemExit):
+            pin_packages.licence_sources(build, ["packages/mpv-prefix/src/mpv-stamp/mpv-done",
+                                                 "packages/libass-prefix/src/libass-stamp/libass-done"])
+
+    def test_info_source_dir(self):
+        text = "method=url\nsource_dir=/w/x86_64/packages/lzo-prefix/src/lzo\nwork_dir=/w/x86_64\n"
+        self.assertEqual(pin_packages.info_source_dir(text), "/w/x86_64/packages/lzo-prefix/src/lzo")
+        self.assertIsNone(pin_packages.info_source_dir("method=git\nwork_dir=/w/src\n"))
+
+
+CREATED_IGNORED = """diff --git a/m4/extra.m4 b/m4/extra.m4
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/m4/extra.m4
+@@ -0,0 +1 @@
++dnl created by the series
+"""
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def shell_functions(names):
+    """The named function definitions, verbatim, from build.sh."""
+    text = (HERE / "build.sh").read_text(encoding="utf-8")
+    bodies = []
+    for name in names:
+        found = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", text, re.S | re.M)
+        assert found, f"build.sh: no function {name}"
+        bodies.append(found.group(0))
+    return "".join(bodies)
+
+
+class PatchStateTest(unittest.TestCase):
+    """A warm build's cached libass source against its patch stamp: a checkout
+    pinned by the real main(), a libass source whose pin this test commits,
+    and a one-patch libass series staged where main() stages the real one."""
+
+    COMMENT = "Say new, because the old word was wrong."
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="patch-state-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.winbuild = self.tmp / "mpv-winbuild-cmake"
+        for fixture, relative in CHECKOUT_FILES.items():
+            path = self.winbuild / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(TESTDATA / fixture, path)
+        self.assertEqual(pin_packages.main(["--winbuild", str(self.winbuild), "--repo", str(REPO)]), 0)
+
+        self.sources = self.tmp / "src"
+        self.source = self.sources / "libass"
+        self.source.mkdir(parents=True)
+        git(self.source, "init", "-q")
+        (self.source / "a.c").write_text("old\n", encoding="utf-8")
+        # Like libass's m4/ax_pthread.m4: the series creates a file its
+        # source's .gitignore covers.
+        (self.source / ".gitignore").write_text("m4/\n", encoding="utf-8")
+        git(self.source, "add", "a.c", ".gitignore")
+        git(self.source, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "pin")
+        self.commit = git(self.source, "rev-parse", "HEAD")
+
+        # This repo's versions.json with libass pinned to the test's commit,
+        # beside a copy of the driver, so its default --repo finds it.
+        self.repo = self.tmp / "repo"
+        (self.repo / "platforms/windows").mkdir(parents=True)
+        shutil.copyfile(HERE / "pin_packages.py", self.repo / "platforms/windows/pin_packages.py")
+        self.versions = json.loads((REPO / "versions.json").read_text(encoding="utf-8"))
+        libass = self.versions["components"]["libass"]
+        libass.setdefault("overrides", {}).setdefault("windows", {})["commit"] = self.commit
+        (self.repo / "versions.json").write_text(json.dumps(self.versions), encoding="utf-8")
+
+        packages = self.winbuild / "packages"
+        for staged in packages.glob("libass-*.patch"):
+            staged.unlink()
+        self.patch = packages / "libass-0001-say-new.patch"
+        self.write_patch(self.COMMENT)
+
+        self.build = self.tmp / "build" / "x86_64"
+        self.stamps = self.build / "packages/libass-prefix/src/libass-stamp"
+        self.state = self.build / ".patch-state"
+        self.state.mkdir(parents=True)
+
+    def write_patch(self, comment):
+        self.patch.write_text(
+            "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n"
+            "Subject: [PATCH] a: say new\n\n"
+            f"{comment}\n---\n" + PATCH + CREATED_IGNORED, encoding="utf-8")
+
+    def patched_warm_tree(self):
+        """What a run that patched libass leaves for the cache: the series
+        applied to the source and the patch step's stamps."""
+        git(self.source, "apply", str(self.patch))
+        self.stamps.mkdir(parents=True)
+        for step in ("download", "patch", "configure", "build", "install", "done"):
+            (self.stamps / f"libass-{step}").touch()
+
+    def libass_state(self):
+        rows = pin_packages.patch_state(self.winbuild, self.versions, self.sources,
+                                        self.build, self.state)
+        return {row[0]: row for row in rows}["libass"]
+
+    def record(self, digest):
+        (self.state / "libass").write_text(f"{digest}\n", encoding="utf-8")
+
+    def test_patch_sets_digest_covers_comments_and_the_pin(self):
+        sets = {row[0]: row for row in pin_packages.patch_sets(self.winbuild, self.versions)}
+        _, commit, digest, patches = sets["libass"]
+        self.assertEqual((commit, patches), (self.commit, [self.patch]))
+        self.write_patch("A reworded comment.")
+        reworded = {row[0]: row for row in pin_packages.patch_sets(self.winbuild, self.versions)}
+        self.assertNotEqual(reworded["libass"][2], digest)
+        self.versions["components"]["libass"]["overrides"]["windows"]["commit"] = "0" * 40
+        moved = {row[0]: row for row in pin_packages.patch_sets(self.winbuild, self.versions)}
+        self.assertNotIn(moved["libass"][2], (digest, reworded["libass"][2]))
+        # Only packages with a patch step have a series to check.
+        self.assertNotIn("mingw-w64", sets)
+
+    def test_holds_patches_compares_the_touched_files(self):
+        self.assertFalse(pin_packages.holds_patches(self.source, self.commit, [self.patch]))
+        git(self.source, "apply", str(self.patch))
+        (self.source / "build-output.o").write_text("objects\n", encoding="utf-8")
+        self.assertTrue(pin_packages.holds_patches(self.source, self.commit, [self.patch]))
+        # The source's own index is left alone.
+        self.assertEqual(git(self.source, "diff", "--cached", "--name-only"), "")
+        (self.source / "a.c").write_text("newer\n", encoding="utf-8")
+        self.assertFalse(pin_packages.holds_patches(self.source, self.commit, [self.patch]))
+        self.assertFalse(pin_packages.holds_patches(self.tmp / "missing", self.commit, [self.patch]))
+
+    def test_patch_verdict(self):
+        verdict = pin_packages.patch_verdict
+        self.assertIsNone(verdict(False, "other", "d", False))
+        self.assertIsNone(verdict(True, "d", "d", True))
+        self.assertIsNone(verdict(True, None, "d", True))
+        self.assertEqual(verdict(True, "other", "d", True)[0], "purge")
+        self.assertEqual(verdict(True, "other", "d", False)[0], "purge")
+        self.assertEqual(verdict(True, None, "d", False)[0], "purge")
+        self.assertEqual(verdict(True, "d", "d", False)[0], "reapply")
+
+    def test_patched_packages_reads_patch_stamps_only(self):
+        self.patched_warm_tree()
+        other = self.build / "packages/mpv-prefix/src/mpv-stamp"
+        other.mkdir(parents=True)
+        (other / "mpv-download").touch()
+        self.assertEqual(pin_packages.patched_packages(self.build), {"libass"})
+
+    def test_stamp_never_stands_beside_another_series(self):
+        _, _, digest, action, patches, reason = self.libass_state()
+        self.assertEqual((action, patches, reason), ("keep", str(self.patch), ""),
+                         "no stamp: the patch step runs anyway")
+        self.patched_warm_tree()
+        self.assertEqual(self.libass_state()[3], "keep", "a tree cached before digests were kept")
+        self.record(digest)
+        self.assertEqual(self.libass_state()[3], "keep")
+        # What winbuild's postremovebuild leaves: stamped, source at the pin.
+        git(self.source, "checkout", "-q", "--", "a.c")
+        self.assertEqual(self.libass_state()[3], "reapply")
+        # The same with no recorded series (the 2026-10-31 cache) can't be trusted.
+        (self.state / "libass").unlink()
+        self.assertEqual(self.libass_state()[3], "purge")
+        git(self.source, "apply", "--include=a.c", str(self.patch))
+        self.record("a digest of another series")
+        self.assertEqual(self.libass_state()[3], "purge")
+
+    def test_warm_build_reapplies_libass_after_a_comment_change(self):
+        # The demo: build.sh's own check_patched_sources over a warm tree.
+        # Run 1 leaves the series applied and stamped and records its digest;
+        # a comment-only edit to the staged libass patch then makes the next
+        # warm run reset libass to the pin and drop its stamps, so the patch
+        # step re-applies the series, and later runs keep what that did.
+        script = shell_functions(["drop_stamps", "purge_component", "check_patched_sources"])
+
+        def warm_run():
+            env = dict(os.environ, HERE=str(self.repo / "platforms/windows"), SRC=str(self.winbuild),
+                       WORK=str(self.tmp), BUILD=str(self.build))
+            run = subprocess.run(["bash", "-c", f"set -euo pipefail\n{script}check_patched_sources\n"],
+                                 env=env, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            return run.stdout
+
+        self.patched_warm_tree()
+        self.assertNotIn("libass", warm_run())
+        recorded = (self.state / "libass").read_text(encoding="utf-8")
+        self.assertEqual(warm_run(), "", "an unchanged series keeps the warm tree")
+
+        self.write_patch("Say new; the comment is all that changed.")
+        out = warm_run()
+        self.assertIn("==> libass: its patch series or pin changed since it was patched; "
+                      "resetting the source and re-applying", out)
+        self.assertEqual((self.source / "a.c").read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(sorted(p.name for p in self.stamps.iterdir()), [],
+                         "every libass stamp dropped, so the patch step re-runs")
+        self.assertNotEqual((self.state / "libass").read_text(encoding="utf-8"), recorded)
+
+        # The patch step re-applies the new series; the next warm run keeps it.
+        git(self.source, "apply", str(self.patch))
+        for step in ("download", "patch", "configure", "build", "install", "done"):
+            (self.stamps / f"libass-{step}").touch()
+        self.assertEqual(warm_run(), "")
+
+        # winbuild's postremovebuild resets the source after install (its
+        # `git clean -df` keeps the ignored file the series created); the next
+        # warm run re-applies the series in place and keeps every stamp.
+        git(self.source, "reset", "--hard", "-q", self.commit)
+        git(self.source, "clean", "-qdf")
+        self.assertTrue((self.source / "m4/extra.m4").exists())
+        self.assertIn("==> libass: its source is back at the pin under its patch stamp; "
+                      "re-applied its series in place", warm_run())
+        self.assertEqual((self.source / "a.c").read_text(encoding="utf-8"), "new\n")
+        self.assertEqual(len(list(self.stamps.iterdir())), 6)
+        self.assertEqual(warm_run(), "")
 
 
 if __name__ == "__main__":

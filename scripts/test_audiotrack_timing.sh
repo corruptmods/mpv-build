@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# Compile the production AudioTrack clock, write, and reset paths. Pass an
-# already-patched mpv tree for offline use; otherwise fetch and patch the pinned
-# source in a temporary directory. JNI is injected; no Android device is needed.
+# Compile the production AudioTrack clock, write, and reset paths and drive
+# them with deterministic JNI delays: passthrough and PCM clocks, startup,
+# E-AC3 counter wrap, partial writes across stop/reset/recreation, DTS-HD
+# unwrapping, a stalled raw TrueHD track demoting to decode, the 3 s recreate
+# retry, audio-stream-silence feeding and stand-down, a playing track whose
+# core has no audio waiting (backing off to 50 ms) instead of writing nothing,
+# and pause/resume without a flush, with a passthrough resume held until the
+# playhead moves and the core's clock (buffer.c) restarted once it returns.
+# Pass an already-patched mpv tree for offline use; otherwise fetch and patch
+# the pinned source in a temporary directory. No Android device is needed.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,6 +56,7 @@ python3 "$E" define "$src" "$workdir/audiotrack_write.inc" --append \
     --name DTSHD_BURST_HEADER \
     --name STALL_TIMEOUT_NS --name STALL_RECOVERED_NS --name STALL_MAX_RECREATES --name STALL_POLL_NS \
     --name RECREATE_GRACE_NS --name RECREATE_RETRY_NS \
+    --name RESUME_HEAD_WAIT_NS --name RESUME_HEAD_POLL_NS \
     --name THREAD_PRIORITY_AUDIO \
     --name PLAYHEAD_STEP_MS --name PLAYHEAD_STEP_MIN_NS --name PLAYHEAD_STEP_MAX_LINES \
     --name KA_AHEAD_NS --name KA_HEAD_STILL_NS --name KA_POLL_NS --name KA_STALL_LOG_NS \
@@ -72,7 +80,13 @@ python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_adoptDtsHdRate --fn write_pending --fn AudioTrack_write \
     --fn AudioTrack_beginRecovery --fn AudioTrack_recreateOrFail \
     --fn AudioTrack_deferredPlay --fn AudioTrack_kaStep --fn ao_thread --fn monitor_thread --fn stop --fn start \
-    --fn set_pause
+    --fn AudioTrack_readHead --fn AudioTrack_awaitResumedHead --fn set_pause
+
+# The core's side of a resume: buffer.c's ao_set_paused, whose clock restarts
+# once the driver's set_pause has returned.
+python3 "$E" range "$source_dir/audio/out/buffer.c" "$workdir/buffer_pause.inc" \
+    --first "void ao_set_paused(struct ao *ao, bool paused, bool eof)" \
+    --last "// Whether audio is playing."
 
 cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \
     -o "$workdir/test" "$root/scripts/test_audiotrack_timing.c" -lm
@@ -81,3 +95,7 @@ cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \
 cc -O2 -std=c11 -Wall -Wextra -Werror -pthread -I"$workdir" \
     -o "$workdir/test_write" "$root/scripts/test_audiotrack_write.c" -lm
 "$workdir/test_write"
+
+cc -O2 -std=c11 -Wall -Wextra -Werror -pthread -I"$workdir" \
+    -o "$workdir/test_resume" "$root/scripts/test_buffer_resume_clock.c"
+"$workdir/test_resume"

@@ -1,30 +1,50 @@
 // Behavioral test for ao_avfoundation's compressed (AVPlayer) sink when the
 // stream never starts
 // (patches/mpv/pool/0040-ao-decode-the-playing-track-to-pcm-when-passthrough-fails.patch,
-// patches/mpv/pool/0041-avfoundation-say-when-avplayer-never-asked-for-the-stream.patch).
+// patches/mpv/pool/0041-avfoundation-say-when-avplayer-never-asked-for-the-stream.patch),
+// and of the clock anchor it keeps while the playhead is parked
+// (patches/mpv/pool/0042-avfoundation-anchor-the-passthrough-clock-to-the-playhead.patch).
 // It drives the driver the way mpv does, against a real AVPlayer, in a process
 // whose main thread never services the main dispatch queue. AVPlayer attaches
 // an item there, so it never asks the resource loader for the stream and the
 // startup supervisor has to give up. mp_time_ns() is a clock the test moves,
-// so the supervisor's two 2 s deadlines pass at once. Run
-// scripts/test_ao_avfoundation_fallback.sh, which builds it against the
-// patched mpv source.
+// so the supervisor's two 2 s deadlines pass at once, and the feed timer's
+// ticks are the test's own. Run scripts/test_ao_avfoundation_fallback.sh,
+// which builds it against the patched mpv source.
 
+#include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+// The feed timer's ticks are tick() below. Left to the real 50 ms timer, the
+// driver would also run feed_avp() on its own between the test's steps, as
+// soon as 50 ms after start(), and every check that counts reads or clock
+// anchors across a tick would count that one too. Every timer the driver sets
+// stays idle; the driver's own source is still created, resumed and cancelled.
+static void idle_timer(dispatch_source_t source, dispatch_time_t start,
+                       uint64_t interval, uint64_t leeway)
+{
+    dispatch_source_set_timer(source, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+}
+#define dispatch_source_set_timer idle_timer
+
 #include "audio/out/ao_avfoundation.m"
 
 // The parts of mpv the driver calls.
-static _Atomic int reloads, fallbacks, reads, streaming_stops;
-static _Atomic int64_t clock_ns;
+static _Atomic int reloads, fallbacks, reads, streaming_stops, anchors;
+static _Atomic int64_t clock_ns, end_time_ns;
 int64_t mp_time_ns(void) { return atomic_load(&clock_ns); }
 void ao_request_reload(struct ao *ao) { reloads++; }
 void ao_request_pcm_fallback(struct ao *ao) { fallbacks++; }
 void ao_stop_streaming(struct ao *ao) { streaming_stops++; }
+void ao_set_end_time_ns(struct ao *ao, int64_t out_time_ns)
+{
+    anchors++;
+    atomic_store(&end_time_ns, out_time_ns);
+}
 bool af_fmt_is_spdif(int format) { return format >= AF_FORMAT_S_AAC && format < AF_FORMAT_COUNT; }
 int af_fmt_to_bytes(int format) { return 2; }
 void *(ta_alloc_size)(void *ta_parent, size_t size) { return calloc(1, size); }
@@ -221,6 +241,18 @@ static void *run(void *unused)
         CHECK(!s.avp_loader_asked, "AVPlayer never asks for the stream while nothing services the main queue");
         CHECK(logged(MSGL_WARN, NULL) == 0, "priming warns about nothing");
 
+        // 0042: a tick that reads nothing still anchors the clock, against
+        // the playhead AVPlayer has not moved: the clock stands at the start
+        // and the pulled stream is all still to play.
+        int reads_primed = reads, anchors_primed = anchors;
+        set_clock(t0 + GRACE / 2);
+        s = tick(ao);
+        int64_t written = CMTimeGetNanoseconds(CMTimeMake(s.pulled_samples, ao->samplerate)) - s.es_dropped_ns;
+        CHECK(reads == reads_primed && anchors == anchors_primed + 1, "a tick that reads nothing anchors the clock");
+        CHECK(written > 0 && end_time_ns == t0 + GRACE / 2 + written,
+              "to the end of the pulled stream against the parked playhead (%.3f s of %.3f s ahead)",
+              (end_time_ns - (t0 + GRACE / 2)) / 1e9, written / 1e9);
+
         // The first deadline: a warning, a seek to the start, and (0041) why.
         set_clock(t0 + GRACE - 1);
         tick(ao);
@@ -246,7 +278,7 @@ static void *run(void *unused)
 
         // Nothing after the request feeds or asks again: ticks, a pause and
         // resume, a seek (reset, then start).
-        int reads_then = reads;
+        int reads_then = reads, anchors_then = anchors;
         for (int n = 1; n <= 3; n++) {
             set_clock(t0 + (2 + n) * GRACE);
             tick(ao);
@@ -263,7 +295,7 @@ static void *run(void *unused)
         }
         CHECK(fallbacks == 1 && reloads == 0,
               "ticks, pause, reset and start request nothing more (%d fallbacks, %d reloads)", fallbacks, reloads);
-        CHECK(reads == reads_then, "nor read any more audio");
+        CHECK(reads == reads_then && anchors == anchors_then, "nor read any more audio or anchor the clock");
         CHECK(logged(MSGL_ERR, "did not start") == 1, "nor give up again");
 
         // uninit() after the fallback stops everything that could call back.

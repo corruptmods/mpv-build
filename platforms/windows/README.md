@@ -25,17 +25,53 @@ apt set plus pip meson >= 1.3.0; only `--configure-only` runs elsewhere.
 
 The zip preserves the sourceforge mpv-dev package shape (`libmpv-2.dll`,
 `libmpv.dll.a`, `include/mpv/*.h` at the archive root), so consumers currently
-fetching the sourceforge 7z only swap URL + hash.
+fetching the sourceforge 7z only swap URL + hash. Beside them sits
+`licenses/` (see "Licence texts").
 
 aarch64 builds are Vulkan/d3d11 only: winbuild's `cmake/packages_check.cmake`
 sets `-Dgl=disabled -Degl-angle=disabled` for that target.
 
+## Licence texts
+
+`licenses/<component>/` holds the licence texts of every component linked
+into `libmpv-2.dll`, copied unchanged from the source tree the build compiled,
+at their path in that tree. `package.sh` collects them with
+`scripts/licenses.py` before zipping, and fails when a component yields no
+text or a keyed component has no folder.
+
+`pin_packages.py --print-licence-sources build/windows/<arch>` derives the set
+from the configured build tree. `ninja -t inputs mpv` names every package whose
+steps the mpv target waits for (85 on aarch64, 87 on x86_64 at the pinned
+winbuild commit). Of those, the packages that put no code into the DLL are
+dropped: curl and the libraries only it links, subrandr, and the Vulkan loader,
+which is a DLL of its own. x265's bit-depth builds fold into x265, and
+opus-dnn's models into opus. The toolchain runtime clang links in statically
+is added: llvm (compiler-rt's builtins, libunwind, libc++, libc++abi) and
+mingw-w64 (the CRT and winpthreads). Each package's source dir is the one
+its ExternalProject recorded beside its stamps. Folders take the versions.json
+name for a pinned package (`svt-av1`, `nv-codec-headers`) and the winbuild
+package name otherwise (`freetype2`, `libjpeg`). The whole graph counts, so a
+header package an arch never includes (angle-headers on aarch64) still gets a
+folder. `mpv-winbuild-cmake` gets none: it publishes no licence, and its code
+in the DLL is patches to packages whose texts ship.
+
+`GROUP_RULES["windows"]` in `scripts/licenses.py` adds what is not a root
+licence file. That covers vendored code the build compiles in (FAST in aom and
+SVT-AV1, x86inc, openal-soft's {fmt} and GSL, SDL's HIDAPI and YUV converters,
+libopenmpt's mpt, x265's HDR10+ library) and licences that exist only as source
+comments (avisynth-headers, nv-codec-headers, PFFFT and Ooura's FFT in libsoxr,
+the Speex resampler in libmysofa). It also adds the llvm and mingw-w64 runtime
+subtrees. Sparse checkouts that leave the root licence out (angle-headers,
+amf-headers, vapoursynth) have it read from git. The not-linked list and the
+rules describe the pinned graph; re-audit both when the winbuild or mpv pin
+moves.
+
 ## Key coarseness
 
 `group.json` lists components `mpv`, `ffmpeg`, `libass`,
-`mpv-winbuild-cmake`, `mingw-w64`, `llvm`, `svt-av1`, `nv-codec-headers`
-and `openssl` (the last five being the packages
-`pin_packages.EXTRA_COMPONENTS` pins). The winbuild graph builds ~60 more dependencies (freetype,
+`mpv-winbuild-cmake`, `mingw-w64`, `llvm`, `svt-av1`, `nv-codec-headers`,
+`openssl` and `fontconfig` (the last six being packages
+`pin_packages.EXTRA_COMPONENTS` pins; it also pins `libaribcaption`). The winbuild graph builds ~60 more dependencies (freetype,
 harfbuzz, x264, dav1d, ...). Those are deliberately NOT individual
 versions.json components: they track whatever `GIT_RESET`/URL pins the
 winbuild commit carries, so they are keyed -- coarsely but honestly --
@@ -53,6 +89,11 @@ exists because the 2026-08-29 secure-API header restructure on mingw-w64
 master broke libvpl's MinGW compat macros mid-day; llvm's `release/22.x`
 branch is the remaining live-fetch in the toolchain and freezes only inside
 a warm cache -- pin it the same way if it ever bites.
+
+`fontconfig` is pinned to `be20036a` because winbuild builds its main tip
+and `git am`s its own fontconfig patches, which upstream dff5c35
+(2026-10-30) broke: every cold build failed at fontconfig's patch step.
+Drop the pin once winbuild rebases its fontconfig patches.
 
 ## CI build-state caching
 
@@ -96,6 +137,17 @@ Why reusing a restored tree is sound:
   moved pin re-drives exactly its dirty subgraph. There is deliberately no
   skip-if-bootstrapped marker: one existed and recorded intent instead of
   reality, serving stale mingw-w64 headers after a pin move;
+- a patch stamp only stands beside the series and pin that produced it. The
+  patch step's command line is a glob, so an edited patch (a comment
+  included) would not re-run it, and a restored source sits at the pin
+  unpatched under its stamp: winbuild's `postremovebuild` resets every git
+  source after install, so a step re-run later compiles it unpatched (libass
+  on 2026-10-31, which mpv then failed to link against). `build.sh` records
+  each patched package's series digest (pin, patch names and bytes) in
+  `.patch-state/`. A different or unrecorded series resets the source and
+  drops the package's stamps, so it is re-patched and rebuilt; at the
+  recorded series, a source back at the pin gets the series re-applied in
+  place and nothing rebuilds (`pin_packages.py --print-patch-state`);
 - `build.sh` fullcleans and rebuilds mpv on every run: upstream's packaging
   steps embed `BUILDDATE` in their command lines and `postremovebuild`
   deletes build trees after install, so a date rollover would otherwise
@@ -115,9 +167,9 @@ matters.
 
 ## Reproducible bytes
 
-A rebuild of a published key has to reproduce the published zip byte for
-byte (`keys.py publish-assets` refuses anything else), so nothing in it may
-record when it was built. Key 442b5d101e4c's `libmpv-2.dll` recorded five
+A key names one build's bytes, so nothing in the zip may record when it was
+built: a stamp makes every rebuild of a key a different binary. Key
+442b5d101e4c's `libmpv-2.dll` recorded five
 clocks: the PE header and debug directory `TimeDateStamp` lld-link takes at
 link time, so every rebuild differed; and OpenSSL's "built on" line, SVT-AV1's
 and mpv's `__DATE__ __TIME__` and davs2's build time, which the cached tree
@@ -214,4 +266,7 @@ commit, the staged series and its PATCH_COMMAND (injected exactly when the
 resolved series is non-empty), the neutralized check-git step, and a second
 run converging. The remaining tests pin the pure rewrites -- the injected
 block matches the mbedtls idiom, the aarch64 cuda gate, the mpv option
-gate, the libmpv-2.pdb capture, and the davs2 build-time rewrite.
+gate, the libmpv-2.pdb capture, and the davs2 build-time rewrite -- and the
+licence-source query: the linked set read from `ninja -t inputs mpv` as ninja
+1.11 and 1.13 print it, the folder names `group.json` keys, and the source
+dirs read from a synthetic build tree.
