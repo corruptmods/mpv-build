@@ -230,6 +230,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_demux_codec_profile.sh` | demuxer-published codec profile matches the decoder's (patch 0204) | PR, main |
 | `test_demux_refresh.sh` | a refresh seek queues nothing twice and keeps the next subtitle (patch 0208) | PR, main |
 | `test_hwdec_recovery.sh` | the hwdec mid-stream error recovery (0025) and `--hwdec-recover-keyframes`/`--hwdec-recover-max-frames`, defaults unchanged (patch 0306) | PR |
+| `test_hevc_hwaccel_tables.sh` | a frame started under a hwaccel is never decoded in software (FFmpeg 0302), and every `tab_mvf` reader is reviewed; structural | PR |
 | `test_lavc_busy_policy.sh` | decoders that wake the filter themselves are not spun | PR, main |
 | `test_libass_series.sh` | the libass series: change detection, renderer handoff, shape cache | main |
 | `test_libass_rounding.c` | ARMv7 VFP rounding; cross-compile and run on an ARMv7 device (header) | manual |

@@ -1,0 +1,47 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: [PATCH] hevc: refuse software slice decoding of a frame without its
+ tables
+
+0030 gives a frame started under a hwaccel no motion vector field (tab_mvf
+stays NULL) and skips clearing its deblocking, CBF, PCM and slice-address
+tables. That is safe only while such a frame is never decoded in software,
+which holds because avctx->hwaccel changes only in get_format() on a new
+SPS. Nothing checks it: if a later FFmpeg changed when the hwaccel can drop
+out, the software path would dereference NULL on untrusted input.
+
+decode_slice_data() now refuses, with an error log and AVERROR_BUG, to
+decode a slice in software when the current frame has no motion vector
+field, before anything on the software path runs. The collocated
+reference read in mvs.c already checks for NULL. With a hwaccel, or a
+software-only decode, nothing changes.
+
+scripts/test_hevc_hwaccel_tables.sh checks that the guard sits between the
+hwaccel return and the software path, and that every function reading a
+frame's tab_mvf is on a reviewed list, so a pin bump that adds a reader
+fails until someone looks at it.
+
+
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index 651401b..128ef03 100644
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -3045,6 +3045,18 @@ static int decode_slice_data(HEVCContext *s, const HEVCLayerContext *l,
+     if (s->avctx->hwaccel)
+         return FF_HW_CALL(s->avctx, decode_slice, nal->raw_data, nal->raw_size);
+ 
++    /* Patch 0030 gives a frame started under a hwaccel no motion vector
++     * field and leaves its deblocking, CBF, PCM and slice-address tables
++     * uncleared, which holds only while such a frame is never decoded in
++     * software: avctx->hwaccel changes only in get_format() on a new SPS.
++     * Everything below reads and writes those tables, so refuse rather
++     * than dereference NULL if a future change ever breaks that. */
++    if (!s->cur_frame || !s->cur_frame->tab_mvf) {
++        av_log(s->avctx, AV_LOG_ERROR, "Software slice decoding of a frame "
++               "started without the software tables; dropping the slice.\n");
++        return AVERROR_BUG;
++    }
++
+     if (s->avctx->profile == AV_PROFILE_HEVC_SCC) {
+         av_log(s->avctx, AV_LOG_ERROR,
+                "SCC profile is not yet implemented in hevc native decoder.\n");

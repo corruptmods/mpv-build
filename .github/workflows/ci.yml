@@ -132,6 +132,9 @@ jobs:
                 # The RPU check before libdovi, over libdovi's own test RPUs
                 # (clones the dovi_tool commit versions.json pins).
                 subprocess.run(['bash', 'scripts/test_dovi_rpu_check.sh', str(dest)], check=True)
+                # The HEVC software-table guard and the reviewed tab_mvf readers
+                # (series.common; the apple tree carries it too).
+                subprocess.run(['bash', 'scripts/test_hevc_hwaccel_tables.sh', str(dest)], check=True)
               if component == 'mpv' and group == 'android':
                 subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_audiotrack_truehd.sh', str(dest)], check=True)

@@ -32,3 +32,7 @@
 # release/9.1); drop it once the pin carries them. Other architectures, and
 # the Apple slices built without asm (Catalyst), keep the C transform.
 0042-lavu-tx-aarch64-neon-inverse-mdct.patch
+# Pluet (corruptmods) patches, 03xx, on top of everything above.
+# A frame 0030 started without its software tables is never decoded in
+# software (test test_hevc_hwaccel_tables.sh).
+0302-hevc-refuse-software-slice-decoding-without-its-tables.patch
