@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum Build {
@@ -186,6 +187,53 @@ final class BinaryManifest {
     }
 }
 
+/// A build input that is not what versions.json pins. The build stops.
+struct BuildInputError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// Build-input verification: a source clone must be at the commit and a
+/// prebuilt archive must have the SHA-256 versions.json records. A pin without
+/// one is an error too, not a pass.
+enum BuildInputs {
+    static func headCommit(of directory: URL) throws -> String {
+        try Utility.launch(path: "/usr/bin/git", arguments: ["rev-parse", "HEAD"],
+                           isOutput: true, currentDirectoryURL: directory)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func verifyCommit(of directory: URL, library: Library) throws {
+        guard let expected = library.commit, !expected.isEmpty else {
+            throw BuildInputError(message: "versions.json records no commit for \(library.canonicalName); "
+                                  + "refusing to build an unverified clone of \(library.url)")
+        }
+        let head = try headCommit(of: directory)
+        guard head == expected.lowercased() else {
+            throw BuildInputError(message: "\(library.canonicalName): \(library.url) at \(library.version) "
+                                  + "is \(head), versions.json records \(expected)")
+        }
+    }
+
+    static func sha256(of file: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: file)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func expectedSHA256(for library: Library) throws -> String {
+        guard let expected = library.sha256, !expected.isEmpty else {
+            throw BuildInputError(message: "versions.json records no sha256 for \(library.canonicalName); "
+                                  + "refusing to use an unverified \(library.url)")
+        }
+        return expected.lowercased()
+    }
+}
+
 class BaseBuild {
     static let defaultPath = "/Library/Frameworks/Python.framework/Versions/Current/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     static var platforms = PlatformType.allCases.filter { $0 != .xros && $0 != .xrsimulator }
@@ -205,22 +253,29 @@ class BaseBuild {
         let patchStateFile = patchStateURL()
 
         if FileManager.default.fileExists(atPath: directoryURL.path) {
-            guard let expectedPatchState else {
-                return
-            }
-
+            // A checkout from an earlier run is reused only at the pinned
+            // commit; any other (a moved tag, an older pin) is cloned again.
+            let atPin = (try? BuildInputs.verifyCommit(of: directoryURL, library: library)) != nil
             let currentPatchState = try? String(contentsOf: patchStateFile, encoding: .utf8)
-            if currentPatchState == expectedPatchState {
+            if atPin && (expectedPatchState == nil || currentPatchState == expectedPatchState) {
                 return
             }
 
-            print("Patch cache changed for \(library.rawValue); refreshing source checkout")
+            print(atPin ? "Patch cache changed for \(library.rawValue); refreshing source checkout"
+                        : "\(library.rawValue) checkout is not at the pinned commit; cloning again")
             try FileManager.default.removeItem(at: directoryURL)
             try? FileManager.default.removeItem(at: patchStateFile)
         }
 
         // pull code from git
         try Utility.launch(path: "/usr/bin/git", arguments: ["-c", "advice.detachedHead=false", "clone", "--recursive", "--depth", "1", "--branch", library.version, library.url, directoryURL.path])
+        // The tag must still name the commit versions.json pinned.
+        do {
+            try BuildInputs.verifyCommit(of: directoryURL, library: library)
+        } catch {
+            try? FileManager.default.removeItem(at: directoryURL)
+            throw error
+        }
 
         for patchFile in patchFiles {
             try Utility.launch(path: "/usr/bin/git", arguments: ["apply", patchFile.path], currentDirectoryURL: directoryURL)
@@ -1012,11 +1067,26 @@ class ZipBaseBuild : BaseBuild {
         if let fileSize = attributes?[FileAttributeKey.size] as? UInt64, fileSize <= 0 {
             try? FileManager.default.removeItem(atPath: directoryURL.path)
         }
-        try! FileManager.default.createDirectory(atPath: directoryURL.path, withIntermediateDirectories: true, attributes: nil)
+        let expected = try BuildInputs.expectedSHA256(for: library)
+        // An archive from an earlier run is reused only if it is still the
+        // pinned one; otherwise it and what was unpacked from it go.
+        if FileManager.default.fileExists(atPath: outputFile.path),
+           (try? BuildInputs.sha256(of: outputFile)) != expected {
+            print("\(library.rawValue) archive is not the pinned one; downloading again")
+            try? FileManager.default.removeItem(atPath: directoryURL.path)
+        }
+        try FileManager.default.createDirectory(atPath: directoryURL.path, withIntermediateDirectories: true, attributes: nil)
 
         if !FileManager.default.fileExists(atPath: outputFile.path) {
-            try! Utility.launch(path: "wget", arguments: ["-O", outputFileName, library.url], currentDirectoryURL: directoryURL)
-            try! Utility.launch(path: "/usr/bin/unzip", arguments: ["-o",outputFileName], currentDirectoryURL: directoryURL)
+            try Utility.launch(path: "wget", arguments: ["-O", outputFileName, library.url], currentDirectoryURL: directoryURL)
+            // Checked before anything is unpacked from it.
+            let actual = try BuildInputs.sha256(of: outputFile)
+            guard actual == expected else {
+                try? FileManager.default.removeItem(atPath: directoryURL.path)
+                throw BuildInputError(message: "\(library.canonicalName): \(library.url) has sha256 \(actual), "
+                                      + "versions.json records \(expected)")
+            }
+            try Utility.launch(path: "/usr/bin/unzip", arguments: ["-o",outputFileName], currentDirectoryURL: directoryURL)
         }
     }
 

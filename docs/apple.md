@@ -11,7 +11,9 @@ the SwiftPM package in `Sources/BuildScripts/` (`make build`); the publish job
 merges the per-platform legs with `scripts/merge_xcframeworks.py`.
 
 Libraries this repository does not compile come from the prebuilt releases
-`versions.json` pins (mostly `mpvkit/*-build`). Their licence texts, and those
+`versions.json` pins (mostly `mpvkit/*-build`). The build checks each archive's
+SHA-256 against `versions.json` before unpacking it, and each source clone's
+commit after cloning, and stops on a mismatch or a pin without one. Their licence texts, and those
 of everything built here, ship as the `_MPVKit` target's resources
 (`Sources/_MPVKit/licenses/`), which Xcode embeds in every app as
 `MPVKit__MPVKit.bundle/licenses/`; see

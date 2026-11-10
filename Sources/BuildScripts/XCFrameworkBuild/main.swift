@@ -55,9 +55,11 @@ do {
     exit(1)
 }
 
-/// One component entry of `versions.json`. Unknown keys (platforms, overrides,
-/// provenance, ...) are ignored here: the Swift driver only consumes the pins
-/// it clones or downloads from.
+/// One component entry of `versions.json`, with its `overrides.apple` folded
+/// in (an apple override is how a component shared with other groups records
+/// the apple prebuilt's hash without moving their keys). Other keys
+/// (platforms, provenance, other groups' overrides, ...) are ignored here: the
+/// Swift driver only consumes the pins it clones or downloads from.
 struct ComponentPin: Decodable {
     let kind: String
     let version: String
@@ -65,6 +67,30 @@ struct ComponentPin: Decodable {
     let sha256: String?
     let ref: String?
     let commit: String?
+
+    private struct Override: Decodable {
+        let kind: String?
+        let version: String?
+        let url: String?
+        let sha256: String?
+        let ref: String?
+        let commit: String?
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, version, url, sha256, ref, commit, overrides
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let apple = (try c.decodeIfPresent([String: Override].self, forKey: .overrides))?["apple"]
+        kind = try apple?.kind ?? c.decode(String.self, forKey: .kind)
+        version = try apple?.version ?? c.decode(String.self, forKey: .version)
+        url = try apple?.url ?? c.decode(String.self, forKey: .url)
+        sha256 = try apple?.sha256 ?? c.decodeIfPresent(String.self, forKey: .sha256)
+        ref = try apple?.ref ?? c.decodeIfPresent(String.self, forKey: .ref)
+        commit = try apple?.commit ?? c.decodeIfPresent(String.self, forKey: .commit)
+    }
 }
 
 /// Reader for the repository-root `versions.json`, the single source of truth
@@ -115,6 +141,17 @@ enum Library: String, CaseIterable {
 
     var url: String {
         Versions.pin(canonicalName).url
+    }
+
+    /// The commit a source clone must be at; versions.json records it for
+    /// every git pin.
+    var commit: String? {
+        Versions.pin(canonicalName).commit
+    }
+
+    /// The SHA-256 a prebuilt archive must have.
+    var sha256: String? {
+        Versions.pin(canonicalName).sha256
     }
 
     /// The xcframework names this library publishes, in the order `Package.swift`

@@ -7,7 +7,8 @@
       "For Git, verify the upstream release-producing tag record, record the full dereferenced root commit, and review its dependency lock or gitlinks before updating.",
       "Run python3 scripts/patches.py check after changing any patch pool or series file, and bash scripts/test_patches.sh after changing scripts/patches.py.",
       "Never derive an expected checksum from bytes inside the production build or verification command.",
-      "A prebuilt's upstream names the source revision its archive was built from, with the vendored subtrees its build fetches into that tree; re-derive it from the build repository at the new release whenever the prebuilt moves. After changing it or the pin of any apple component, run python3 scripts/licenses.py apple and commit Sources/_MPVKit/licenses; CI fails while they differ."
+      "A prebuilt's upstream names the source revision its archive was built from, with the vendored subtrees its build fetches into that tree; re-derive it from the build repository at the new release whenever the prebuilt moves. After changing it or the pin of any apple component, run python3 scripts/licenses.py apple and commit Sources/_MPVKit/licenses; CI fails while they differ.",
+      "The apple driver refuses a source clone whose HEAD is not the recorded commit and a prebuilt archive without a matching sha256 (scripts/test_build_inputs.sh). For a component other groups override with a git source, record the apple prebuilt's sha256 in overrides.apple, so it does not fold into their keys."
     ]
   },
   "components": {
@@ -219,7 +220,8 @@
       "kind": "prebuilt",
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libunibreak-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "06f7e68102bb9f9f963b2517455dc543f438f7beccd002edcd63dcd1cbccd9a5",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 754574 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://github.com/adah1972/libunibreak",
         "ref": "libunibreak_6_1",
@@ -245,7 +247,8 @@
       "kind": "prebuilt",
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libfreetype-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "f0eec59e51f4137ba57afa849393ba4815c25418870b9511990bd4ebeacdbfaf",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 5789325 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://github.com/freetype/freetype",
         "mirror": "https://gitlab.freedesktop.org/freetype/freetype.git",
@@ -262,7 +265,8 @@
       "kind": "prebuilt",
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libfribidi-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "e20ccc160ea2995f2ef2c5ee0ec50f307cbc10c371fb299b5df62546de07d59d",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 391452 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://github.com/fribidi/fribidi",
         "ref": "v1.0.12",
@@ -278,7 +282,8 @@
       "kind": "prebuilt",
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libharfbuzz-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "c1f56b4f47b64b15e0be16a93703a6db484079878de16b6d598d22055d86f24c",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 19617295 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://github.com/harfbuzz/harfbuzz",
         "ref": "8.1.1",
@@ -294,7 +299,8 @@
       "kind": "prebuilt",
       "version": "1.4.0",
       "url": "https://github.com/mpvkit/libbluray-build/releases/download/1.4.0/libbluray-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "c0302f43258ba41d9661dea0be4a7c9c1dd59d30d284ecfbf7319157c8e8a8de",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 2625844 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://code.videolan.org/videolan/libbluray.git",
         "ref": "1.4.0",
@@ -316,7 +322,7 @@
       "kind": "prebuilt",
       "version": "3.3.5",
       "url": "https://github.com/mpvkit/openssl-build/releases/download/3.3.5/openssl-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "provenance": "Apple prebuilt; its archive hash is recorded in overrides.apple.",
       "upstream": {
         "url": "https://github.com/openssl/openssl",
         "ref": "openssl-3.3.5",
@@ -345,6 +351,10 @@
           "ref": "openssl-4.0.3",
           "commit": "af1775b60dfa141a4ad762585052cabeb9f37e9e",
           "provenance": "TLS backend of the android ffmpeg, replacing mbedTLS 3.6.5 (edde746/plezy#2643). On a 32-bit Fire TV Stick 4K Max core the libavformat HTTPS read path cost 31.8 cycles/byte with mbedTLS, which offers ChaCha20-Poly1305 first and so gets it from servers that honor client order, and 24.5 when AES-256-GCM is forced, since its GCM runs one 16-byte block per call; OpenSSL's Armv8 assembly negotiates AES-256-GCM at 9.2. Same pin and tag verification as overrides.windows; download.sh clones it without submodules, which are test-only."
+        },
+        "apple": {
+          "sha256": "8bc37424aa98fdeac17fd00fbeea7b784a39f1f800cc7f9e0c948d3b169c6f2f",
+          "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 44619276 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match."
         }
       }
     },
@@ -368,7 +378,7 @@
       "kind": "prebuilt",
       "version": "3.3.2",
       "url": "https://github.com/mpvkit/libdovi-build/releases/download/3.3.2/libdovi-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "provenance": "Apple prebuilt; its archive hash is recorded in overrides.apple.",
       "upstream": {
         "url": "https://github.com/quietvoid/dovi_tool",
         "ref": "libdovi-3.3.2",
@@ -388,6 +398,10 @@
           "ref": "2.3.1",
           "commit": "b25558062e4a56973482ec70133bd7b891320e48",
           "provenance": "Source for the former v2.3.1 prebuilts, now rebuilt with the Android parser bounds patch. Verified upstream release 2.3.1 and lightweight tag b25558062e4a56973482ec70133bd7b891320e48 via git ls-remote on 2026-09-04; reviewed dolby_vision/Cargo.lock (registry checksums, no git dependencies), used with --locked."
+        },
+        "apple": {
+          "sha256": "81b85386016a012391c473674ef96e4e494fa76aef2f7b6c102a335e844644f8",
+          "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 11413568 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match."
         }
       }
     },
@@ -395,7 +409,8 @@
       "kind": "prebuilt",
       "version": "1.4.1",
       "url": "https://github.com/mpvkit/moltenvk-build/releases/download/1.4.1/MoltenVK-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "9f65e1025f49c55394da475e40fbe1da8dbd10382d730ce81ebc4c5ac40104d1",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 27976317 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://github.com/KhronosGroup/MoltenVK",
         "ref": "v1.4.1",
@@ -433,7 +448,8 @@
       "kind": "prebuilt",
       "version": "2025.5.0",
       "url": "https://github.com/mpvkit/libshaderc-build/releases/download/2025.5.0/libshaderc-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "1079da73a292e5b2cea6a02fa2208c4935ead79a98043f81708424510e0ab53f",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 122917658 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://github.com/google/shaderc",
         "ref": "v2025.5",
@@ -463,7 +479,8 @@
       "kind": "prebuilt",
       "version": "2.17.0",
       "url": "https://github.com/mpvkit/lcms2-build/releases/download/2.17.0/lcms2-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "8c118b2c04e2440ecf25ffebfa7952ebb09aba83a71378e3b9ed45dae3a6115a",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 3007879 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://github.com/mm2/Little-CMS",
         "ref": "lcms2.17",
@@ -479,7 +496,7 @@
       "kind": "prebuilt",
       "version": "7.351.0-2512",
       "url": "https://github.com/mpvkit/libplacebo-build/releases/download/7.351.0-2512/libplacebo-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "provenance": "Apple prebuilt; its archive hash is recorded in overrides.apple.",
       "upstream": {
         "url": "https://github.com/haasn/libplacebo",
         "mirror": "https://code.videolan.org/videolan/libplacebo.git",
@@ -525,6 +542,10 @@
           "ref": "v7.360.1",
           "commit": "cee9b076f2c63104ccfd497fa79c39a867293ec4",
           "provenance": "Same pin as overrides.android: official VideoLAN GitLab annotated tag object 719cc95244a1f1d648dd72459822e026e6530f22 (v7.360.1, PGP-signed by llyyr) dereferences to this root commit, and haasn/libplacebo reports the same tag object and commit. Gitlinks are identical to v7.360.0's. The mirror is consulted only after the primary fails, and the commit pin is verified identically either way. Brings the OpenGL sync-object leak fix (mpv#12708) to this GL-only build."
+        },
+        "apple": {
+          "sha256": "aa8574c1160deb17863a82258d9a4289e5a5413ca3a58f5e3b12bd25e5585919",
+          "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 8484225 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match."
         }
       }
     },
@@ -532,7 +553,8 @@
       "kind": "prebuilt",
       "version": "1.5.3-neon",
       "url": "https://github.com/edde746/libdav1d-build/releases/download/1.5.3-neon/libdav1d-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "ae80dd63322cd8acc262f6a825334b363f41c3182cb1a3ec7490c644aef27095",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 7281523 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://github.com/videolan/dav1d",
         "mirror": "https://code.videolan.org/videolan/dav1d.git",
@@ -549,7 +571,8 @@
       "kind": "prebuilt",
       "version": "0.0.8-xcode",
       "url": "https://github.com/mpvkit/libuchardet-build/releases/download/0.0.8-xcode/libuchardet-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "2e530b2d5448a1ca9d1f0a6b3ddf80729a870a6ec6c0f8555bc89c58143f01d1",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 1240388 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://gitlab.freedesktop.org/uchardet/uchardet",
         "ref": "v0.0.8",
@@ -565,7 +588,8 @@
       "kind": "prebuilt",
       "version": "2.1.0-xcode",
       "url": "https://github.com/mpvkit/libluajit-build/releases/download/2.1.0-xcode/libluajit-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "sha256": "e4dc3a930e699dbfa76cce4b6e583589d8093bd7e6e4b7fc5778c890d7d93430",
+      "provenance": "Hashed 2026-11-10: the archive the apple driver downloads from this URL, fetched into an empty directory and hashed (sha256, 2554505 bytes), equals the sha256 GitHub publishes for that release asset (gh api .../releases/tags/<tag>, assets[].digest). Nothing was unzipped or run. The apple driver now refuses an archive that does not match.",
       "upstream": {
         "url": "https://github.com/LuaJIT/LuaJIT.git",
         "commit": "eba91fceb67a0a0163a9222869bf254c988c48c4",
