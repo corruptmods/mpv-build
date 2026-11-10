@@ -18,7 +18,7 @@ jobs:
       contents: read
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Validate patch series
         run: python3 scripts/patches.py check
@@ -191,7 +191,7 @@ jobs:
       contents: read
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # rust-std's text comes from this toolchain's share/doc/rust, which is the
       # same on every host; its cargo resolves libdovi's crates.
@@ -212,7 +212,7 @@ jobs:
     outputs:
       natives: ${{ steps.stale.outputs.natives }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # The tarballs are built only when this tree moves their key (a pin,
       # patch, driver or toolchain change): the AAR must build against the
@@ -247,7 +247,7 @@ jobs:
       contents: read
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Test spatial audio output
         run: bash scripts/test_ao_spatial.sh
@@ -278,7 +278,7 @@ jobs:
       contents: write
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Show Xcode version
         run: xcodebuild -version

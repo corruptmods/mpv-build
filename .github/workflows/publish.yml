@@ -69,7 +69,7 @@ jobs:
     # Apple libc exposes it. Keep them on the compiler they are written for.
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Test AO PCM lookahead
         run: ./scripts/test_ao_pcm_lookahead.sh
@@ -261,7 +261,7 @@ jobs:
       # the `--release` every record and upload verb takes.
       release: ${{ steps.release.outputs.release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Validate patch series
         run: python3 scripts/patches.py check
@@ -321,7 +321,7 @@ jobs:
       # The full history, every branch and tag: prune-releases keeps any
       # per-run release that some version of artifacts.json or Package.swift
       # on any ref points at, so it must see all of them.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -373,7 +373,7 @@ jobs:
             platforms: tvos-simulator
             platform_type: tvsimulator
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # rustup is named rather than assumed: macos-26 images have changed how
       # they ship it (rustup-init's ~/.cargo/bin until 20261013, Homebrew's
@@ -434,7 +434,7 @@ jobs:
         run: bash scripts/test_build_date.sh dist/release/*.zip
 
       - name: Upload platform build (${{ matrix.name }})
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: apple-${{ matrix.name }}
           path: |
@@ -451,10 +451,10 @@ jobs:
       contents: write
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download platform builds
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: apple-*
           path: ./dist/partials
@@ -498,7 +498,7 @@ jobs:
             --release ${{ needs.plan.outputs.release }}
 
       - name: Upload manifest for the commit job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: manifest-apple
           path: |
@@ -541,7 +541,7 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # KEY makes container-build.sh run package.sh inside the container, so
       # the tarball comes out already named by content; ARCH pins the name's
@@ -563,7 +563,7 @@ jobs:
             dist/release/libmpv-linux-${{ matrix.arch }}-symbols.zip
 
       - name: Upload platform build (${{ matrix.arch }})
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-${{ matrix.arch }}
           path: |
@@ -594,7 +594,7 @@ jobs:
       matrix:
         arch: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Core set validated through the pinned configure (git..libtool;
       # unzip+patch are hard configure requirements, zip is for package.sh),
@@ -653,7 +653,7 @@ jobs:
       # suffix keeps every run's save unique so failed bootstraps still
       # checkpoint their progress.
       - name: Restore build state cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             build/windows/${{ matrix.arch }}
@@ -684,7 +684,7 @@ jobs:
 
       - name: Save build state cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             build/windows/${{ matrix.arch }}
@@ -693,7 +693,7 @@ jobs:
           key: windows-ep2-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-${{ hashFiles('versions.json', 'patches/**') }}-${{ github.run_id }}
 
       - name: Upload platform build (${{ matrix.arch }})
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-${{ matrix.arch }}
           path: ./dist/release/*.zip
@@ -728,7 +728,7 @@ jobs:
           - group: windows
             artifacts: windows-*
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # A group with nothing stale keeps its committed section and is skipped
       # rather than published; the manifest job's gate below is what proves
@@ -750,7 +750,7 @@ jobs:
       # manifest does not describe the artifacts this commit has to publish.
       - name: Download platform builds
         if: steps.stale.outputs.stale == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: ${{ matrix.artifacts }}
           path: ./dist/partials
@@ -809,7 +809,7 @@ jobs:
 
       - name: Upload manifest for the commit job
         if: steps.stale.outputs.stale == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: manifest-${{ matrix.group }}
           path: ./artifacts.json
@@ -831,10 +831,10 @@ jobs:
       contents: write
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download group manifests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: manifest-*
           path: ./dist/manifests
@@ -907,7 +907,7 @@ jobs:
       # release job deletes before it rebuilds into a release of its own.
       - name: Push binary manifest
         if: steps.changes.outputs.changed == 'true' && github.ref == 'refs/heads/main'
-        uses: EndBug/add-and-commit@v9
+        uses: EndBug/add-and-commit@a94899bca583c204427a224a7af87c02f9b325d5 # v9
         with:
           default_author: github_actions
           add: |
