@@ -1,0 +1,871 @@
+From: corruptmods <13516012+corruptmods@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: [PATCH] vo_avfoundation: never wait on the main thread at teardown
+
+preinit, uninit, recover_display_layer, ensure_osd_layer and
+update_avfoundation_geometry (per frame with zoom or pan) did a
+dispatch_sync to the main queue. uninit always did, to remove the layer's
+KVO, so a host calling mpv_terminate_destroy() on its main thread
+deadlocked: the core joins the VO thread, which waited for the main
+thread. Any blocking libmpv call from the main thread could deadlock the
+same way when it met vo_create()'s preinit rendezvous or a synchronous
+VOCTRL.
+
+The KVO observer becomes the VO's main-thread link (the "avf main-thread
+link" region):
+
+- uninit detaches the link under its lock (no main-thread wait) and hands
+  the app-state observers, the KVO registration, the layers' timebase and
+  the link's own references to a main-queue block. Callbacks reach the VO
+  only through the link, so one that runs after uninit finds no VO. The
+  timebase is cleared only if it is still this VO's.
+- The main thread caches the layer's pixel size and gravity (from KVO, and
+  from a coalesced refresh queued on every read); update_avfoundation_
+  geometry reads the cache. A KVO change made off the main thread refreshes
+  the cache on the main queue before it flags the VO.
+- recover_display_layer reads the renderer's status and flushes on the VO
+  thread, where the file already enqueues, flushes and reads status
+  everywhere else.
+- preinit's setup (timebase, observers, KVO, first geometry read) and the
+  OSD layer's creation still wait for the main thread, at most 500 ms
+  each, because the VO uses their results on its next frame. A block that
+  runs later still completes, and sets pending_main_late; VOCTRL_CHECK_
+  EVENTS then adopts the OSD layer and re-reads the geometry.
+
+With a main thread that services its queue, the order and the values the
+VO sees are what they were. Object lifetimes are unchanged except that the
+last release of the observers, the display layer reference and the
+timebase reference now happen on the main queue after uninit returns.
+
+scripts/test_avf_main_thread_link.sh compiles the region against real
+layers and the real main queue: teardown from a thread the main thread is
+joining, a callback after detach, the geometry cache, the bounded wait
+timing out and its late completion, and the OSD layer handoff.
+
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index a3d3e19..2b644cd 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -48,6 +48,7 @@
+ #import <QuartzCore/QuartzCore.h>
+ #import <Metal/Metal.h>
+ #import <TargetConditionals.h>
++#include <os/lock.h>
+ 
+ #if TARGET_OS_IPHONE
+ #import <UIKit/UIKit.h>
+@@ -656,17 +657,21 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+     // App-active presentation resync (iOS/tvOS). The system suspends the
+     // autonomous AVSampleBufferDisplayLayer on resign-active without setting
+     // requiresFlushToResumeDecoding, so we force a layer recovery on resume.
+-    id app_active_observer;
+-    id app_resign_observer;
+-    bool presentation_suspended;
++    // The notification observers live in the main-thread link below.
+     atomic_bool pending_presentation_resync;
+ 
+     // Host layer resize tracking (KVO). The embedding app owns the --wid
+     // layer and resizes it directly (device rotation, external-display
+     // moves); no VOCTRL fires for that, so a KVO observer flags it and
+-    // VOCTRL_CHECK_EVENTS resyncs the cached OSD geometry.
++    // VOCTRL_CHECK_EVENTS resyncs the cached OSD geometry. The observer is
++    // also the VO's main-thread link (MPVLayerGeometryObserver): it caches
++    // the layer's geometry for the VO thread and carries the work the VO
++    // hands the main thread; see "avf main-thread link".
+     id layer_geometry_observer;
+     atomic_bool pending_layer_geometry_sync;
++    // A main-thread block the VO stopped waiting for has since run; the VO
++    // adopts what it did (the OSD layer, the layer geometry).
++    atomic_bool pending_main_late;
+     // The layer's videoGravity, read with its size by
+     // update_avfoundation_geometry; it decides the user shaders' output size.
+     enum avf_gravity layer_gravity;
+@@ -704,22 +709,293 @@ static CGFloat get_screen_scale(void)
+ #endif
+ }
+ 
+-static void dispatch_main_sync_safe(dispatch_block_t block);
+ static void clear_subtitle_cache(struct priv *p);
+ static void clear_osd_layer(struct vo *vo);
+ static void ahead_invalidate(struct priv *p, double pts);
+ static void release_ci_compositor(struct priv *p);
+ static const struct m_sub_options avfoundation_conf;
+ 
+-// KVO observer for host-driven resizes of the --wid display layer. The
+-// callback runs on whatever thread mutates the layer (the app's main
+-// thread); it must only flag the change and wake the VO thread.
++// How long a retired layer stays hidden before it leaves the layer tree.
++// Leaving the tree drops the layer's video receiver and image queue, and on
++// macOS 27 tearing those down while WindowServer still composites the layer
++// can wedge the display: it stops presenting, the WindowServer watchdog
++// fires and the Mac panics (plezy#2823). Hidden first, the layer is out of
++// the frames WindowServer presents by then; 200 ms is several refreshes even
++// at 24 Hz.
++#define AVF_LAYER_RETIRE_DELAY_NS MP_TIME_MS_TO_NS(200)
++
++// --- avf main-thread link
++// The VO thread does not wait for the main thread, except for a bounded wait
++// in two places, and never while it tears down. A host may call a blocking
++// libmpv function, or mpv_terminate_destroy(), on its main thread, and
++// libmpv can be waiting for this VO at that moment (vo_create()'s preinit
++// rendezvous, a synchronous VOCTRL, the join on the VO thread at destroy).
++// A dispatch_sync() to the main queue from here then never returns.
++//
++// So everything the VO needs from the main thread goes through this object:
++//  - The main thread caches the layer's size in pixels and its gravity, from
++//    KVO and after every main-thread block that touches the layer; the VO
++//    thread reads the cache under the lock and queues a refresh, so a change
++//    KVO did not report reaches the next read.
++//  - The KVO and application-state callbacks reach the VO only through
++//    `vo`, which uninit clears under the lock (held only for the callbacks'
++//    atomic stores and vo_wakeup(), never across a main-thread wait), so a
++//    callback that runs after uninit finds no VO.
++//  - Teardown hands the observers, the layers and the timebase to a
++//    main-queue block that unregisters and releases them. Main-queue blocks
++//    run in order, so it always follows the block that registered them.
++//  - The two bounded waits (avf_link_run_on_main) are preinit's setup and
++//    the OSD layer's creation, whose results the VO uses on its next frame.
++//    Each waits at most AVF_MAIN_WAIT_NS; a block that runs later still
++//    completes and sets pending_main_late, and the VO adopts its result then.
++//
++// Locking: `lock` nests inside nothing the VO thread holds and is held over
++// vo_wakeup() (vo_internal.lock) only; the VO thread never takes it while it
++// holds vo_internal.lock.
++
++#define AVF_MAIN_WAIT_NS MP_TIME_MS_TO_NS(500)
++
+ @interface MPVLayerGeometryObserver : NSObject {
+ @public
+-    struct vo *vo;
++    os_unfair_lock lock;
++    struct vo *vo;                      // lock; NULL once uninit detached it
++    // lock: the display layer's geometry as update_avfoundation_geometry
++    // used to read it on the main thread.
++    bool geometry_valid;
++    int geometry_w, geometry_h;
++    enum avf_gravity geometry_gravity;
++    atomic_bool refresh_queued;
++    // lock: an OSD layer the main thread made that the VO has not adopted,
++    // and whether one is being made / was dropped while it was.
++    AVSampleBufferDisplayLayer *pending_osd_layer;
++    bool osd_layer_creating, osd_layer_discard, osd_layer_orphaned;
++    // Main thread only.
++    AVSampleBufferDisplayLayer *layer;  // retained; released by teardown
++    bool observing;                     // KVO registered on `layer`
++    id app_resign_observer, app_active_observer;
++    bool presentation_suspended;
+ }
+ @end
+ 
++// Read the layer as update_avfoundation_geometry did and store it. Main
++// thread only: get_screen_scale() asks UIScreen/NSScreen.
++static void avf_link_refresh_geometry(MPVLayerGeometryObserver *link)
++{
++    AVSampleBufferDisplayLayer *displayLayer = link->layer;
++    if (!displayLayer)
++        return;
++
++    CGFloat scale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
++    CGSize size = displayLayer.bounds.size;
++    if (size.width <= 0 || size.height <= 0)
++        size = displayLayer.frame.size;
++
++    int width = MPMAX(1, (int)(size.width * scale + 0.5));
++    int height = MPMAX(1, (int)(size.height * scale + 0.5));
++
++    enum avf_gravity gravity = AVF_GRAVITY_ASPECT;
++    AVLayerVideoGravity layerGravity = displayLayer.videoGravity;
++    if ([layerGravity isEqualToString:AVLayerVideoGravityResizeAspectFill])
++        gravity = AVF_GRAVITY_ASPECT_FILL;
++    else if ([layerGravity isEqualToString:AVLayerVideoGravityResize])
++        gravity = AVF_GRAVITY_RESIZE;
++
++    os_unfair_lock_lock(&link->lock);
++    link->geometry_valid = true;
++    link->geometry_w = width;
++    link->geometry_h = height;
++    link->geometry_gravity = gravity;
++    os_unfair_lock_unlock(&link->lock);
++}
++
++// Refresh the cache on the main thread soon; any thread. Coalesced.
++static void avf_link_queue_refresh(MPVLayerGeometryObserver *link)
++{
++    if (atomic_exchange(&link->refresh_queued, true))
++        return;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        atomic_store(&link->refresh_queued, false);
++        avf_link_refresh_geometry(link);
++    });
++}
++
++// The layer's size, scale or gravity changed: refresh the cache, then flag
++// the VO. The user shaders' output follows the layer's size and gravity; the
++// OSD only its size. Main thread.
++static void avf_link_layer_changed(MPVLayerGeometryObserver *link, bool gravity_only)
++{
++    avf_link_refresh_geometry(link);
++    os_unfair_lock_lock(&link->lock);
++    struct vo *target = link->vo;
++    if (target) {
++        struct priv *p = target->priv;
++        atomic_store(&p->shader_layer_stale, true);
++        if (!gravity_only)
++            atomic_store(&p->pending_layer_geometry_sync, true);
++        vo_wakeup(target);
++    }
++    os_unfair_lock_unlock(&link->lock);
++}
++
++// Run `block` on the main thread and wait up to AVF_MAIN_WAIT_NS for it.
++// Returns whether it ran in that time. If it did not, it still runs; it
++// then sets pending_main_late and wakes the VO, if the VO is still there.
++// The block must reach VO state only through the link: it can outlive the
++// VO.
++static bool avf_link_run_on_main(MPVLayerGeometryObserver *link,
++                                 dispatch_block_t block)
++{
++    if ([NSThread isMainThread]) {
++        block();
++        return true;
++    }
++
++    // 0: queued, 1: ran, 2: the waiter gave up. Under link->lock.
++    __block int state = 0;
++    dispatch_semaphore_t done = dispatch_semaphore_create(0);
++    dispatch_retain(done); // the block's reference
++    dispatch_async(dispatch_get_main_queue(), ^{
++        block();
++        os_unfair_lock_lock(&link->lock);
++        bool late = state == 2;
++        state = 1;
++        struct vo *target = link->vo;
++        if (late && target) {
++            struct priv *p = target->priv;
++            atomic_store(&p->pending_main_late, true);
++            vo_wakeup(target);
++        }
++        os_unfair_lock_unlock(&link->lock);
++        dispatch_semaphore_signal(done);
++        dispatch_release(done);
++    });
++
++    bool ran = dispatch_semaphore_wait(done,
++                   dispatch_time(DISPATCH_TIME_NOW, AVF_MAIN_WAIT_NS)) == 0;
++    if (!ran) {
++        os_unfair_lock_lock(&link->lock);
++        ran = state == 1;
++        if (!ran)
++            state = 2;
++        os_unfair_lock_unlock(&link->lock);
++    }
++    dispatch_release(done);
++    return ran;
++}
++
++// Hide a retired OSD layer now and take it out of the tree once that has
++// reached the screen (AVF_LAYER_RETIRE_DELAY_NS). Takes over the caller's
++// reference. Any thread.
++static void avf_retire_osd_layer(AVSampleBufferDisplayLayer *osdLayer)
++{
++    if (!osdLayer)
++        return;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [CATransaction begin];
++        [CATransaction setDisableActions:YES];
++        osdLayer.hidden = YES;
++        [CATransaction commit];
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, AVF_LAYER_RETIRE_DELAY_NS),
++                       dispatch_get_main_queue(), ^{
++            [osdLayer removeFromSuperlayer];
++            [osdLayer release];
++        });
++    });
++}
++
++// Take the OSD layer the main thread made, if there is one. Returns true when
++// one was taken or one is still being made (the caller must not start
++// another). VO thread.
++static bool avf_link_adopt_osd_layer(MPVLayerGeometryObserver *link,
++                                     AVSampleBufferDisplayLayer **out,
++                                     bool *orphaned)
++{
++    os_unfair_lock_lock(&link->lock);
++    bool busy = link->osd_layer_creating;
++    if (busy)
++        link->osd_layer_discard = false; // wanted after all
++    AVSampleBufferDisplayLayer *layer = link->pending_osd_layer;
++    link->pending_osd_layer = nil;
++    *orphaned = link->osd_layer_orphaned;
++    link->osd_layer_orphaned = false;
++    os_unfair_lock_unlock(&link->lock);
++    if (layer)
++        *out = layer;
++    return layer || busy;
++}
++
++// Drop an OSD layer the main thread made or is making for the VO. VO thread.
++static void avf_link_discard_osd_layer(MPVLayerGeometryObserver *link)
++{
++    os_unfair_lock_lock(&link->lock);
++    AVSampleBufferDisplayLayer *layer = link->pending_osd_layer;
++    link->pending_osd_layer = nil;
++    if (link->osd_layer_creating)
++        link->osd_layer_discard = true;
++    os_unfair_lock_unlock(&link->lock);
++    avf_retire_osd_layer(layer);
++}
++
++// After this no callback reaches `vo`. Called by uninit on the VO thread;
++// waits for at most a callback's atomic stores.
++static void avf_link_detach(MPVLayerGeometryObserver *link)
++{
++    os_unfair_lock_lock(&link->lock);
++    link->vo = NULL;
++    os_unfair_lock_unlock(&link->lock);
++}
++
++// Undo what preinit's setup registered, on the main thread, and release the
++// link: the observers, the KVO registration, the layers' timebase (only if
++// it is still this VO's) and any OSD layer nobody adopted. Takes over a
++// reference to `timebase` and the VO's reference to `link`. Any thread; never
++// waits.
++static void avf_link_teardown(MPVLayerGeometryObserver *link,
++                              AVSampleBufferDisplayLayer *osdLayer,
++                              CMTimebaseRef timebase)
++{
++    avf_link_detach(link);
++    dispatch_async(dispatch_get_main_queue(), ^{
++#if TARGET_OS_IPHONE
++        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++        if (link->app_resign_observer) {
++            [nc removeObserver:link->app_resign_observer];
++            [link->app_resign_observer release];
++            link->app_resign_observer = nil;
++        }
++        if (link->app_active_observer) {
++            [nc removeObserver:link->app_active_observer];
++            [link->app_active_observer release];
++            link->app_active_observer = nil;
++        }
++#endif
++        AVSampleBufferDisplayLayer *displayLayer = link->layer;
++        if (link->observing) {
++            [displayLayer removeObserver:link forKeyPath:@"bounds"];
++            [displayLayer removeObserver:link forKeyPath:@"contentsScale"];
++            [displayLayer removeObserver:link forKeyPath:@"videoGravity"];
++            link->observing = false;
++        }
++        // A later VO on the same layer sets its own timebase in a block
++        // queued after this one; never clear one that is not ours.
++        if (timebase) {
++            if (displayLayer.controlTimebase == timebase)
++                displayLayer.controlTimebase = NULL;
++            if (osdLayer.controlTimebase == timebase)
++                osdLayer.controlTimebase = NULL;
++            CFRelease(timebase);
++        }
++        os_unfair_lock_lock(&link->lock);
++        AVSampleBufferDisplayLayer *orphan = link->pending_osd_layer;
++        link->pending_osd_layer = nil;
++        os_unfair_lock_unlock(&link->lock);
++        avf_retire_osd_layer(orphan);
++        link->layer = nil;
++        [displayLayer release];
++        [link release];
++    });
++}
++
+ @implementation MPVLayerGeometryObserver
+ - (void)observeValueForKeyPath:(NSString *)keyPath
+                       ofObject:(id)object
+@@ -733,18 +1009,20 @@ - (void)observeValueForKeyPath:(NSString *)keyPath
+     if (oldValue && newValue && [oldValue isEqual:newValue])
+         return;
+ 
+-    struct vo *target = self->vo;
+-    if (!target)
+-        return;
+-    struct priv *p = target->priv;
+-    // The user shaders' output follows the layer's size and gravity; the OSD
+-    // only its size.
+-    atomic_store(&p->shader_layer_stale, true);
+-    if (![keyPath isEqualToString:@"videoGravity"])
+-        atomic_store(&p->pending_layer_geometry_sync, true);
+-    vo_wakeup(target);
++    // The callback runs on whatever thread mutated the layer, normally the
++    // app's main thread. Elsewhere, the cache is refreshed on the main
++    // thread first so the VO never acts on the flag with the old size.
++    bool gravity_only = [keyPath isEqualToString:@"videoGravity"];
++    if ([NSThread isMainThread]) {
++        avf_link_layer_changed(self, gravity_only);
++    } else {
++        dispatch_async(dispatch_get_main_queue(), ^{
++            avf_link_layer_changed(self, gravity_only);
++        });
++    }
+ }
+ @end
++// --- end avf main-thread link
+ 
+ static bool should_composite_into_video(struct priv *p)
+ {
+@@ -1172,25 +1450,23 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
+     }
+     p->last_display_recovery_ns = now;
+ 
+-    __block AVQueuedSampleBufferRenderingStatus status =
+-        AVQueuedSampleBufferRenderingStatusUnknown;
+-    __block bool requires_flush = false;
+-    __block bool ready = false;
+-    __block int64_t timebase_ns = 0;
+-    __block double timebase_rate = 0.0;
+-
+-    dispatch_main_sync_safe(^{
+-        status = sample_buffer_renderer_status(displayLayer);
+-        requires_flush = sample_buffer_renderer_requires_flush(displayLayer);
+-        ready = sample_buffer_renderer_is_ready(displayLayer);
+-        if (p->timebase) {
+-            timebase_ns = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
+-            timebase_rate = CMTimebaseGetRate(p->timebase);
+-        }
++    // On the VO thread, like every other status read, flush and enqueue in
++    // this file: waiting for the main thread here could deadlock (see "avf
++    // main-thread link"), and flushing from the thread that enqueues keeps
++    // the flush ahead of the next frame.
++    AVQueuedSampleBufferRenderingStatus status =
++        sample_buffer_renderer_status(displayLayer);
++    bool requires_flush = sample_buffer_renderer_requires_flush(displayLayer);
++    bool ready = sample_buffer_renderer_is_ready(displayLayer);
++    int64_t timebase_ns = 0;
++    double timebase_rate = 0.0;
++    if (p->timebase) {
++        timebase_ns = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
++        timebase_rate = CMTimebaseGetRate(p->timebase);
++    }
+ 
+-        sample_buffer_renderer_flush(displayLayer);
+-        sample_buffer_renderer_flush(osdLayer);
+-    });
++    sample_buffer_renderer_flush(displayLayer);
++    sample_buffer_renderer_flush(osdLayer);
+ 
+     MP_WARN(vo, "Recovered AVFoundation display layer after %s "
+                 "(status=%ld, requiresFlush=%s, ready=%s, "
+@@ -1233,33 +1509,28 @@ static void update_avfoundation_geometry(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+ 
+-    if (!p->displayLayer)
++    MPVLayerGeometryObserver *link = p->layer_geometry_observer;
++    if (!p->displayLayer || !link)
+         return;
+ 
+-    __block int width = 0;
+-    __block int height = 0;
+-    __block enum avf_gravity gravity = AVF_GRAVITY_ASPECT;
+-    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
+-    dispatch_main_sync_safe(^{
+-        CGFloat scale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
+-        CGSize size = displayLayer.bounds.size;
+-        if (size.width <= 0 || size.height <= 0)
+-            size = displayLayer.frame.size;
+-
+-        width = MPMAX(1, (int)(size.width * scale + 0.5));
+-        height = MPMAX(1, (int)(size.height * scale + 0.5));
+-
+-        AVLayerVideoGravity layerGravity = displayLayer.videoGravity;
+-        if ([layerGravity isEqualToString:AVLayerVideoGravityResizeAspectFill])
+-            gravity = AVF_GRAVITY_ASPECT_FILL;
+-        else if ([layerGravity isEqualToString:AVLayerVideoGravityResize])
+-            gravity = AVF_GRAVITY_RESIZE;
+-    });
+-    [displayLayer release];
++    // The main thread's cache (avf_link_refresh_geometry), not a wait for
++    // the main thread. The queued refresh lets a change KVO did not report
++    // reach the next call.
++    os_unfair_lock_lock(&link->lock);
++    bool valid = link->geometry_valid;
++    int width = link->geometry_w;
++    int height = link->geometry_h;
++    enum avf_gravity gravity = link->geometry_gravity;
++    os_unfair_lock_unlock(&link->lock);
++    avf_link_queue_refresh(link);
+ 
++    vo->monitor_par = 1.0;
++    // Not read yet only when preinit stopped waiting for the main thread;
++    // pending_main_late brings the VO back here once it has been.
++    if (!valid)
++        return;
+     vo->dwidth = width;
+     vo->dheight = height;
+-    vo->monitor_par = 1.0;
+     p->layer_gravity = gravity;
+ }
+ 
+@@ -1445,19 +1716,22 @@ static CGRect layer_untransformed_frame(CALayer *layer)
+                       size.width, size.height);
+ }
+ 
+-// Create the timed OSD sample-buffer layer, in inline mode only. Its lifetime
+-// follows the composite_osd/pip_composite_osd options, so sync_osd_layer_frame
+-// can call this again after the user turns compositing back off.
+-static void ensure_osd_layer(struct vo *vo)
++// Make the timed OSD layer on the main thread, waiting at most
++// AVF_MAIN_WAIT_NS: it joins the host's layer tree. The result waits in the
++// link for the VO to adopt; a late one is adopted on pending_main_late. The
++// block holds its own references to the layers and the timebase, and none
++// to the VO.
++static void make_osd_layer(MPVLayerGeometryObserver *link,
++                           AVSampleBufferDisplayLayer *osdDisplayLayer,
++                           CMTimebaseRef timebase)
+ {
+-    struct priv *p = vo->priv;
+-
+-    if (p->osdLayer || !should_use_inline_osd_layer(p) || !p->displayLayer)
+-        return;
++    os_unfair_lock_lock(&link->lock);
++    link->osd_layer_creating = true;
++    link->osd_layer_discard = false;
++    os_unfair_lock_unlock(&link->lock);
+ 
+-    AVSampleBufferDisplayLayer *osdDisplayLayer = [p->displayLayer retain];
+-    CMTimebaseRef osdTimebase = p->timebase;
+-    dispatch_main_sync_safe(^{
++    CMTimebaseRef osdTimebase = timebase ? (CMTimebaseRef)CFRetain(timebase) : NULL;
++    avf_link_run_on_main(link, ^{
+         AVSampleBufferDisplayLayer *osdLayer = [[AVSampleBufferDisplayLayer alloc] init];
+         osdLayer.frame = layer_untransformed_frame(osdDisplayLayer);
+         osdLayer.anchorPoint = CGPointMake(0.5, 0.5);
+@@ -1477,21 +1751,43 @@ static void ensure_osd_layer(struct vo *vo)
+         } else {
+             [osdDisplayLayer addSublayer:osdLayer];
+             osdLayer.frame = osdDisplayLayer.bounds;
+-            MP_WARN(vo, "displayLayer has no superlayer; OSD will degrade direct scanout\n");
+         }
+-        p->osdLayer = osdLayer;
++        if (osdTimebase)
++            CFRelease(osdTimebase);
++
++        // Dropped while it was being made, or the VO is gone: retire it.
++        os_unfair_lock_lock(&link->lock);
++        link->osd_layer_creating = false;
++        bool keep = link->vo && !link->osd_layer_discard;
++        if (keep) {
++            link->pending_osd_layer = osdLayer;
++            link->osd_layer_orphaned = !parent;
++        }
++        os_unfair_lock_unlock(&link->lock);
++        if (!keep)
++            avf_retire_osd_layer(osdLayer);
+     });
+-    [osdDisplayLayer release];
+ }
+ 
+-// How long a retired layer stays hidden before it leaves the layer tree.
+-// Leaving the tree drops the layer's video receiver and image queue, and on
+-// macOS 27 tearing those down while WindowServer still composites the layer
+-// can wedge the display: it stops presenting, the WindowServer watchdog
+-// fires and the Mac panics (plezy#2823). Hidden first, the layer is out of
+-// the frames WindowServer presents by then; 200 ms is several refreshes even
+-// at 24 Hz.
+-#define AVF_LAYER_RETIRE_DELAY_NS MP_TIME_MS_TO_NS(200)
++// Create the timed OSD sample-buffer layer, in inline mode only. Its lifetime
++// follows the composite_osd/pip_composite_osd options, so sync_osd_layer_frame
++// can call this again after the user turns compositing back off.
++static void ensure_osd_layer(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    MPVLayerGeometryObserver *link = p->layer_geometry_observer;
++
++    if (p->osdLayer || !should_use_inline_osd_layer(p) || !p->displayLayer || !link)
++        return;
++
++    bool orphaned = false;
++    if (!avf_link_adopt_osd_layer(link, &p->osdLayer, &orphaned)) {
++        make_osd_layer(link, p->displayLayer, p->timebase);
++        avf_link_adopt_osd_layer(link, &p->osdLayer, &orphaned);
++    }
++    if (orphaned)
++        MP_WARN(vo, "displayLayer has no superlayer; OSD will degrade direct scanout\n");
++}
+ 
+ // Drop the timed OSD layer, on uninit or when the composite path takes the
+ // OSD over: hidden now, out of the tree once that has reached the screen.
+@@ -1499,23 +1795,17 @@ static void release_osd_layer(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+ 
++    // One the main thread made or is making that the VO has not adopted.
++    if (p->layer_geometry_observer)
++        avf_link_discard_osd_layer(p->layer_geometry_observer);
++
+     if (!p->osdLayer)
+         return;
+ 
+     AVSampleBufferDisplayLayer *osdLayer = p->osdLayer;
+     p->osdLayer = nil;
+     p->osd_layer_dirty = false;
+-    dispatch_async(dispatch_get_main_queue(), ^{
+-        [CATransaction begin];
+-        [CATransaction setDisableActions:YES];
+-        osdLayer.hidden = YES;
+-        [CATransaction commit];
+-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, AVF_LAYER_RETIRE_DELAY_NS),
+-                       dispatch_get_main_queue(), ^{
+-            [osdLayer removeFromSuperlayer];
+-            [osdLayer release];
+-        });
+-    });
++    avf_retire_osd_layer(osdLayer);
+ }
+ 
+ // Keep the OSD layer over the display layer's untransformed geometry.
+@@ -1806,15 +2096,6 @@ static void report_presentation_diagnostics(struct vo *vo)
+     p->diag_drift_peak_ns = 0;
+ }
+ 
+-static void dispatch_main_sync_safe(dispatch_block_t block)
+-{
+-    if ([NSThread isMainThread]) {
+-        block();
+-    } else {
+-        dispatch_sync(dispatch_get_main_queue(), block);
+-    }
+-}
+-
+ static AVBufferRef *create_videotoolbox_device_ref(struct vo *vo)
+ {
+     AVBufferRef *device_ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
+@@ -4363,12 +4644,83 @@ static int preinit(struct vo *vo)
+         CMTimebaseSetTime(p->timebase, cm_time_from_ns(0));
+         CMTimebaseSetRate(p->timebase, 0.0);
+     }
+-    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
+-    CMTimebaseRef timebase = p->timebase;
+-    dispatch_main_sync_safe(^{
++
++    atomic_init(&p->pending_presentation_resync, false);
++    atomic_init(&p->app_inactive, false);
++    atomic_init(&p->pending_layer_geometry_sync, false);
++    atomic_init(&p->shader_layer_stale, false);
++    atomic_init(&p->pending_main_late, false);
++
++    // Everything preinit needs from the main thread, in one bounded wait
++    // (see "avf main-thread link"): the layer's timebase, the app-state
++    // observers, the layer's KVO and the first geometry read. A late block
++    // still does all of it, and teardown's block always runs after it.
++    MPVLayerGeometryObserver *link = [[MPVLayerGeometryObserver alloc] init];
++    link->vo = vo;
++    link->layer = [p->displayLayer retain];
++    p->layer_geometry_observer = link;
++    CMTimebaseRef timebase = (CMTimebaseRef)CFRetain(p->timebase);
++    avf_link_run_on_main(link, ^{
++        AVSampleBufferDisplayLayer *displayLayer = link->layer;
+         displayLayer.controlTimebase = timebase;
++        CFRelease(timebase);
++#if TARGET_OS_IPHONE
++        bool inactive = UIApplication.sharedApplication.applicationState !=
++                        UIApplicationStateActive;
++        os_unfair_lock_lock(&link->lock);
++        if (link->vo)
++            atomic_store(&((struct priv *)link->vo->priv)->app_inactive, inactive);
++        os_unfair_lock_unlock(&link->lock);
++        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++        link->app_resign_observer = [[nc
++            addObserverForName:UIApplicationWillResignActiveNotification
++                        object:nil
++                         queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification *note) {
++            link->presentation_suspended = true;
++            os_unfair_lock_lock(&link->lock);
++            if (link->vo)
++                atomic_store(&((struct priv *)link->vo->priv)->app_inactive, true);
++            os_unfair_lock_unlock(&link->lock);
++        }] retain];
++        link->app_active_observer = [[nc
++            addObserverForName:UIApplicationDidBecomeActiveNotification
++                        object:nil
++                         queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification *note) {
++            bool resync = link->presentation_suspended;
++            link->presentation_suspended = false;
++            os_unfair_lock_lock(&link->lock);
++            struct vo *target = link->vo;
++            if (target) {
++                struct priv *tp = target->priv;
++                atomic_store(&tp->app_inactive, false);
++                if (resync) {
++                    atomic_store(&tp->pending_presentation_resync, true);
++                    vo_wakeup(target);
++                }
++            }
++            os_unfair_lock_unlock(&link->lock);
++        }] retain];
++#endif
++        [displayLayer addObserver:link
++                       forKeyPath:@"bounds"
++                          options:NSKeyValueObservingOptionOld |
++                                  NSKeyValueObservingOptionNew
++                          context:NULL];
++        [displayLayer addObserver:link
++                       forKeyPath:@"contentsScale"
++                          options:NSKeyValueObservingOptionOld |
++                                  NSKeyValueObservingOptionNew
++                          context:NULL];
++        [displayLayer addObserver:link
++                       forKeyPath:@"videoGravity"
++                          options:NSKeyValueObservingOptionOld |
++                                  NSKeyValueObservingOptionNew
++                          context:NULL];
++        link->observing = true;
++        avf_link_refresh_geometry(link);
+     });
+-    [displayLayer release];
+     vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+     vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
+     p->ready_queue = dispatch_queue_create("avfoundation ready",
+@@ -4392,62 +4744,6 @@ static int preinit(struct vo *vo)
+     };
+     hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
+ 
+-    atomic_init(&p->pending_presentation_resync, false);
+-    atomic_init(&p->app_inactive, false);
+-#if TARGET_OS_IPHONE
+-    dispatch_main_sync_safe(^{
+-        atomic_store(&p->app_inactive, UIApplication.sharedApplication.applicationState !=
+-                                       UIApplicationStateActive);
+-        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+-        p->app_resign_observer = [[nc
+-            addObserverForName:UIApplicationWillResignActiveNotification
+-                        object:nil
+-                         queue:[NSOperationQueue mainQueue]
+-                    usingBlock:^(NSNotification *note) {
+-            p->presentation_suspended = true;
+-            atomic_store(&p->app_inactive, true);
+-        }] retain];
+-        p->app_active_observer = [[nc
+-            addObserverForName:UIApplicationDidBecomeActiveNotification
+-                        object:nil
+-                         queue:[NSOperationQueue mainQueue]
+-                    usingBlock:^(NSNotification *note) {
+-            atomic_store(&p->app_inactive, false);
+-            if (p->presentation_suspended) {
+-                p->presentation_suspended = false;
+-                atomic_store(&p->pending_presentation_resync, true);
+-                vo_wakeup(vo);
+-            }
+-        }] retain];
+-    });
+-#endif
+-
+-    atomic_init(&p->pending_layer_geometry_sync, false);
+-    atomic_init(&p->shader_layer_stale, false);
+-    {
+-        MPVLayerGeometryObserver *observer = [[MPVLayerGeometryObserver alloc] init];
+-        observer->vo = vo;
+-        AVSampleBufferDisplayLayer *observedLayer = [p->displayLayer retain];
+-        dispatch_main_sync_safe(^{
+-            [observedLayer addObserver:observer
+-                            forKeyPath:@"bounds"
+-                               options:NSKeyValueObservingOptionOld |
+-                                       NSKeyValueObservingOptionNew
+-                               context:NULL];
+-            [observedLayer addObserver:observer
+-                            forKeyPath:@"contentsScale"
+-                               options:NSKeyValueObservingOptionOld |
+-                                       NSKeyValueObservingOptionNew
+-                               context:NULL];
+-            [observedLayer addObserver:observer
+-                            forKeyPath:@"videoGravity"
+-                               options:NSKeyValueObservingOptionOld |
+-                                       NSKeyValueObservingOptionNew
+-                               context:NULL];
+-        });
+-        [observedLayer release];
+-        p->layer_geometry_observer = observer;
+-    }
+ 
+     return 0;
+ }
+@@ -5064,36 +5360,6 @@ static void uninit(struct vo *vo)
+         osd_ahead_stop(&p->ahead);
+     osd_ahead_destroy(&p->ahead);
+ 
+-#if TARGET_OS_IPHONE
+-    if (p->app_resign_observer || p->app_active_observer) {
+-        dispatch_main_sync_safe(^{
+-            NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+-            if (p->app_resign_observer) {
+-                [nc removeObserver:p->app_resign_observer];
+-                [p->app_resign_observer release];
+-                p->app_resign_observer = nil;
+-            }
+-            if (p->app_active_observer) {
+-                [nc removeObserver:p->app_active_observer];
+-                [p->app_active_observer release];
+-                p->app_active_observer = nil;
+-            }
+-        });
+-    }
+-#endif
+-
+-    if (p->layer_geometry_observer) {
+-        MPVLayerGeometryObserver *observer = p->layer_geometry_observer;
+-        p->layer_geometry_observer = nil;
+-        AVSampleBufferDisplayLayer *observedLayer = [p->displayLayer retain];
+-        dispatch_main_sync_safe(^{
+-            [observedLayer removeObserver:observer forKeyPath:@"bounds"];
+-            [observedLayer removeObserver:observer forKeyPath:@"contentsScale"];
+-            [observedLayer removeObserver:observer forKeyPath:@"videoGravity"];
+-        });
+-        [observedLayer release];
+-        [observer release];
+-    }
+ 
+     mp_image_unrefp(&p->next_image);
+     mp_image_unrefp(&p->ahead_shown_image);
+@@ -5103,15 +5369,17 @@ static void uninit(struct vo *vo)
+     sample_buffer_renderer_flush(p->displayLayer);
+     sample_buffer_renderer_flush(p->osdLayer);
+ 
++    // No wait for the main thread: the host may be destroying this player
++    // from it (mpv_terminate_destroy() joins this thread). The observers,
++    // the layers' timebase and the link's own references go to a main-queue
++    // block, and nothing reaches this VO once the link is detached.
++    if (p->layer_geometry_observer) {
++        MPVLayerGeometryObserver *link = p->layer_geometry_observer;
++        p->layer_geometry_observer = nil;
++        avf_link_teardown(link, p->osdLayer,
++                          p->timebase ? (CMTimebaseRef)CFRetain(p->timebase) : NULL);
++    }
+     if (p->timebase) {
+-        AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
+-        AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
+-        dispatch_main_sync_safe(^{
+-            displayLayer.controlTimebase = NULL;
+-            osdLayer.controlTimebase = NULL;
+-        });
+-        [displayLayer release];
+-        [osdLayer release];
+         CFRelease(p->timebase);
+         p->timebase = NULL;
+     }
+@@ -5180,6 +5448,16 @@ static int control(struct vo *vo, uint32_t request, void *data)
+ 
+     switch (request) {
+     case VOCTRL_CHECK_EVENTS:
++        if (atomic_exchange(&p->pending_main_late, false)) {
++            // A main-thread block the VO stopped waiting for has run: adopt
++            // its OSD layer and read the geometry it cached.
++            MP_VERBOSE(vo, "Main thread caught up; adopting its layer state\n");
++            ensure_osd_layer(vo);
++            update_avfoundation_geometry(vo);
++            invalidate_render_geometry(vo);
++            atomic_store(&p->shader_layer_stale, true);
++            atomic_store(&p->pending_layer_geometry_sync, true);
++        }
+         if (atomic_exchange(&p->pending_presentation_resync, false))
+             recover_display_layer(vo, "presentation resume", true);
+         if (atomic_exchange(&p->pending_layer_geometry_sync, false))

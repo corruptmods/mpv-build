@@ -217,6 +217,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_avf_osd_blend.sh` | the OSD's NEON libass blend matches its scalar reference bit for bit (patch 0043; aarch64 host) | main |
 | `test_avf_osd_dirty_set.sh` | each overlay buffer's next clear covers everything last drawn into it (patch 0043) | main |
 | `test_avf_osd_layer_geometry.sh` | the inline OSD layer's placement (macOS) | main |
+| `test_avf_main_thread_link.sh` | vo_avfoundation never waits on the main thread at teardown, at most 500 ms elsewhere; its geometry cache and late main-thread work (patch 0300; macOS) | main |
 | `test_avf_pip_frame_space_osd.sh` | frame-space OSD geometry for PiP | main |
 | `test_avf_shader_target.sh` | the size vo_avfoundation renders `--glsl-shaders` at, and the part of the frame that fills it, per display-layer gravity | main |
 | `test_avf_timebase_servo.sh` | the timebase servo and rate decisions | main |

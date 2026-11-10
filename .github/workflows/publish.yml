@@ -98,6 +98,9 @@ jobs:
       - name: Test AVFoundation OSD layer geometry under host zoom
         run: ./scripts/test_avf_osd_layer_geometry.sh
 
+      - name: Test AVFoundation main-thread link
+        run: ./scripts/test_avf_main_thread_link.sh
+
       - name: Test AVFoundation subtitle wait policy
         run: ./scripts/test_avf_osd_ahead.sh
 

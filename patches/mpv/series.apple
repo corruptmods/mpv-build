@@ -32,3 +32,7 @@
 0044-vo-queue-slack-for-vos-that-present-by-timestamp.patch
 # --hwdec-threads defaults to 1: VideoToolbox decodes one frame at a time.
 0045-vd-lavc-one-hwdec-thread-by-default-on-apple-platforms.patch
+# Pluet (corruptmods) patches, 03xx, on top of everything above.
+# vo_avfoundation never waits on the main thread at teardown, and at most
+# 500 ms anywhere else (test test_avf_main_thread_link.sh).
+0300-avfoundation-never-wait-on-the-main-thread-at-teardown.patch
